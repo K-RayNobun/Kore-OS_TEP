@@ -1,0 +1,61 @@
+volumes:
+  kore-ipc:
+
+services:
+  kore-os-admin:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kore-os-admin
+    volumes:
+      - ./config:/usr/src/app/config:ro
+      - ./reports:/home/elo/reports
+      - ./home/elo/data:/home/elo/data
+      - ./home/elo/workspace:/home/elo/workspace
+      - kore-ipc:/tmp
+    env_file:
+      - .env
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+    profiles:
+      - production
+
+  kore-os-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kore-os-gateway
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./config:/usr/src/app/config:ro
+      - ./reports:/home/elo/reports
+      - ./home/elo/data:/home/elo/data
+      - ./home/elo/.local/share:/home/elo/.local/share
+      - kore-ipc:/tmp
+    env_file:
+      - .env
+    restart: unless-stopped
+    command: ["node", "dist/server.js"]
+    profiles:
+      - production
+
+  kore-os-admin-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kore-os-admin-dev
+    volumes:
+      - ./config:/usr/src/app/config:ro
+      - ./src:/usr/src/app/src
+      - ./reports:/home/elo/reports
+      - ./home/elo/data:/home/elo/data
+      - ./home/elo/workspace:/home/elo/workspace
+    env_file:
+      - .env
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+    profiles:
+      - development

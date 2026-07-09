@@ -1,0 +1,21 @@
+{
+  "providers": {
+    "zhipu": [
+      {
+        "id": "pool_key_01",
+        "key": "4d5c22e174ea46729723474d91e5b500.7yNVQ0a1FXIqutq8"
+      },
+      {
+        "id": "pool_key_02",
+        "key": "b2dbb08e988d4758b29e4498032ec099.qJKRTe9BBiUy3hkg"
+      }
+    ],
+    "gemini": [
+      {
+        "id": "pool_key_01",
+        "key": "AIzaSyDA9sHddmKTFO_TR9Lx49GJ9dQDRcbyBdo"
+      }
+    ]
+  },
+  "default_cooldown_ms": 60000
+}
