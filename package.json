@@ -8,7 +8,8 @@
     "dev:gateway": "tsx src/server.ts",
     "build": "tsc",
     "start": "node dist/index.js",
-    "start:gateway": "node dist/server.js"
+    "start:gateway": "node dist/server.js",
+    "test": "KORE_DB_PATH=/tmp/kore-test/tasks.db tsx --test tests/**/*.test.ts"
   },
   "keywords": [],
   "author": "",
@@ -19,6 +20,7 @@
     "@fastify/websocket": "^11.0.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "better-sqlite3": "^11.0.0",
+    "cron-parser": "^5.6.1",
     "fastify": "^5.0.0",
     "playwright": "^1.51.0"
   },

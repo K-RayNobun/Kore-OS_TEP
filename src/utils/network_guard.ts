@@ -8,6 +8,14 @@ import dns from "node:dns/promises";
  */
 export class NetworkGuard {
     private readonly PRIVATE_IP_PATTERN = /^(127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|::1$|fc00::)/;
+    private readonly BLOCKED_HOSTNAMES = new Set([
+      "localhost",
+      "127.0.0.1",
+      "::1",
+      "169.254.169.254",
+      "metadata.google.internal",
+      "metadata.internal"
+    ]);
 
     public validateURL(url: string): boolean {
         try {
@@ -17,6 +25,21 @@ export class NetworkGuard {
             return true;
         } catch {
             return false;
+        }
+    }
+
+    public validateUrlForTool(url: string, toolName: string): void {
+        if (!this.validateURL(url)) {
+            throw new Error(`[NETWORK_GUARD] SSRF blocked for tool '${toolName}': ${url}`);
+        }
+        try {
+            const parsed = new URL(url);
+            if (this.BLOCKED_HOSTNAMES.has(parsed.hostname.toLowerCase())) {
+                throw new Error(`[NETWORK_GUARD] Access to blocked host '${parsed.hostname}' rejected for tool '${toolName}'`);
+            }
+        } catch (error: any) {
+            if (error.message.includes("[NETWORK_GUARD]")) throw error;
+            throw new Error(`[NETWORK_GUARD] Invalid URL for tool '${toolName}': ${url}`);
         }
     }
 }

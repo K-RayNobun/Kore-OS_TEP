@@ -1,5 +1,6 @@
 volumes:
   kore-ipc:
+  kore-marketing-metrics:
 
 services:
   kore-os-admin:
@@ -7,12 +8,22 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: kore-os-admin
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m
+    security_opt:
+      - no-new-privileges:true
+      - seccomp:./docker/seccomp-profile.json
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
     volumes:
       - ./config:/usr/src/app/config:ro
       - ./reports:/home/elo/reports
-      - ./home/elo/data:/home/elo/data
-      - ./home/elo/workspace:/home/elo/workspace
+      - kore-marketing-metrics:/home/elo/data
       - kore-ipc:/tmp
+      - ./home/elo/workspace:/home/elo/workspace
     env_file:
       - .env
     restart: unless-stopped
@@ -20,24 +31,44 @@ services:
     tty: true
     profiles:
       - production
+    depends_on:
+      - kore-os-gateway
+    command: ["node", "dist/index.js"]
 
   kore-os-gateway:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: kore-os-gateway
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m
+    security_opt:
+      - no-new-privileges:true
+      - seccomp:./docker/seccomp-profile.json
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
     ports:
       - "3000:3000"
     volumes:
       - ./config:/usr/src/app/config:ro
       - ./reports:/home/elo/reports
-      - ./home/elo/data:/home/elo/data
-      - ./home/elo/.local/share:/home/elo/.local/share
+      - kore-marketing-metrics:/home/elo/data
       - kore-ipc:/tmp
+      - ./home/elo/.local/share:/home/elo/.local/share
+      - ./src/pwa:/usr/src/app/pwa:ro
     env_file:
       - .env
     restart: unless-stopped
     command: ["node", "dist/server.js"]
+    healthcheck:
+      test: ["/docker/healthcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
     profiles:
       - production
 
@@ -52,6 +83,7 @@ services:
       - ./reports:/home/elo/reports
       - ./home/elo/data:/home/elo/data
       - ./home/elo/workspace:/home/elo/workspace
+      - ./src/pwa:/usr/src/app/pwa
     env_file:
       - .env
     restart: unless-stopped
@@ -59,3 +91,4 @@ services:
     tty: true
     profiles:
       - development
+    command: ["node", "dist/index.js"]

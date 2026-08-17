@@ -27,7 +27,7 @@ export interface AppendResult {
 }
 
 export interface SysInspectParams {
-  mode: "skeleton" | "grep_logs" | "read_db" | "append";
+  mode: "skeleton" | "paged" | "grep_logs" | "read_db" | "append";
   targetPath?: string;
   pattern?: string;
   query?: string;
@@ -35,6 +35,8 @@ export interface SysInspectParams {
   taskId?: number;
   breadcrumb?: string;
   missionId?: string;
+  pageSize?: number;
+  pageToken?: string;
 }
 
 const skeletonCache = new Map<string, { timestamp: number; result: SkeletonResult }>();
@@ -55,7 +57,9 @@ export class SysInspect {
   async inspect(params: SysInspectParams): Promise<SkeletonResult | GrepLogsResult | ReadDbResult | AppendResult> {
     switch (params.mode) {
       case "skeleton":
-        return this.extractSkeleton(params.targetPath || "/home/elo/workspace/src");
+        return this.extractSkeleton(params.targetPath || "/home/elo/workspace/src", params.pageSize || 10);
+      case "paged":
+        return this.extractPagedSkeleton(params.targetPath || "/home/elo/workspace/src", params.pageSize || 5, params.pageToken);
       case "grep_logs":
         return this.grepLogs(params.pattern || "", params.missionId);
       case "read_db":
@@ -70,8 +74,8 @@ export class SysInspect {
     }
   }
 
-  private async extractSkeleton(targetPath: string): Promise<SkeletonResult> {
-    const cacheKey = targetPath;
+  private async extractSkeleton(targetPath: string, maxFiles: number = 10): Promise<SkeletonResult> {
+    const cacheKey = `${targetPath}:${maxFiles}`;
     const cached = skeletonCache.get(cacheKey);
     if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
       this.cacheHits++;
@@ -89,7 +93,7 @@ export class SysInspect {
 
     try {
       const entries = readdirSync(targetPath, { recursive: true });
-      const tsFiles = entries.filter(e => typeof e === "string" && e.endsWith(".ts")).slice(0, 10);
+      const tsFiles = entries.filter(e => typeof e === "string" && e.endsWith(".ts")).slice(0, maxFiles);
 
       for (const file of tsFiles) {
         const fullPath = join(targetPath, file as string);
@@ -129,10 +133,98 @@ export class SysInspect {
       }
 
       skeletonCache.set(cacheKey, { timestamp: Date.now(), result });
-      return result;
+      return this.enforceTokenCap(result);
     } catch (error: any) {
       throw new Error(`Skeleton extraction failed: ${error.message}`);
     }
+  }
+
+  private async extractPagedSkeleton(targetPath: string, pageSize: number, pageToken?: string): Promise<SkeletonResult> {
+    const cacheKey = `${targetPath}:paged:${pageSize}:${pageToken || "start"}`;
+    const cached = skeletonCache.get(cacheKey);
+    if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
+      this.cacheHits++;
+      return { ...cached.result, cache_hit: true };
+    }
+
+    this.cacheMisses++;
+    const result: SkeletonResult = {
+      imports: [],
+      classes: [],
+      interfaces: [],
+      functions: [],
+      cache_hit: false
+    };
+
+    try {
+      const entries = readdirSync(targetPath, { recursive: true });
+      const tsFiles = entries.filter(e => typeof e === "string" && e.endsWith(".ts"));
+      const startIdx = pageToken ? parseInt(pageToken, 10) || 0 : 0;
+      const pageFiles = tsFiles.slice(startIdx, startIdx + pageSize);
+
+      for (const file of pageFiles) {
+        const fullPath = join(targetPath, file as string);
+        try {
+          const content = readFileSync(fullPath, "utf8");
+          const sourceFile = ts.createSourceFile(fullPath, content, ts.ScriptTarget.Latest, true);
+
+          sourceFile.forEachChild((node) => {
+            if (ts.isImportDeclaration(node) && node.moduleSpecifier && ts.isStringLiteral(node.moduleSpecifier)) {
+              result.imports.push(node.moduleSpecifier.text);
+            }
+            if (ts.isClassDeclaration(node) && node.name) {
+              const methods = node.members
+                .filter(m => ts.isMethodDeclaration(m) && m.name)
+                .map(m => `${(m.name as ts.Identifier).text}()`);
+              result.classes.push({ name: node.name.text, methods });
+            }
+            if (ts.isInterfaceDeclaration(node)) {
+              const properties = node.members
+                .filter(m => ts.isPropertySignature(m) && m.name)
+                .map(m => `${(m.name as ts.Identifier).text}: any`);
+              result.interfaces.push({ name: node.name?.text || "Anonymous", properties });
+            }
+            if (ts.isFunctionDeclaration(node) && node.name) {
+              const params = node.parameters.map(p => (p.name as ts.Identifier).getText()).join(",");
+              result.functions.push({
+                name: node.name.text,
+                params,
+                return: node.type?.getText() || "void"
+              });
+            }
+          });
+
+        } catch {
+          // Skip files that can't be read
+        }
+      }
+
+      const capped = this.enforceTokenCap(result);
+      const nextToken = startIdx + pageSize < tsFiles.length ? String(startIdx + pageSize) : undefined;
+      (capped as any).page_token = nextToken;
+      (capped as any).truncated = nextToken !== undefined;
+      return capped;
+    } catch (error: any) {
+      throw new Error(`Paged skeleton extraction failed: ${error.message}`);
+    }
+  }
+
+  private enforceTokenCap(result: SkeletonResult): SkeletonResult {
+    const json = JSON.stringify(result);
+    const tokens = Math.ceil(json.length / 4);
+    if (tokens <= 1000) return result;
+
+    const trimmed: SkeletonResult = {
+      imports: result.imports.slice(0, 5),
+      classes: result.classes.slice(0, 3),
+      interfaces: result.interfaces.slice(0, 3),
+      functions: result.functions.slice(0, 3)
+    };
+    if (result.cache_hit !== undefined) {
+      (trimmed as any).cache_hit = result.cache_hit;
+    }
+    (trimmed as any).truncated = true;
+    return trimmed;
   }
 
   private async grepLogs(pattern: string, missionId?: string): Promise<GrepLogsResult> {

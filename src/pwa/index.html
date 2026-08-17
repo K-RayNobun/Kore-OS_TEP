@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="theme-color" content="#0a0a0a">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>Kore OS TEP</title>
+  <link rel="manifest" href="/pwa/manifest.json">
+  <link rel="stylesheet" href="/pwa/styles.css">
+</head>
+<body>
+  <div id="app">
+    <nav>
+      <button id="tab-login" class="tab-btn active">Login</button>
+      <button id="tab-terminal" class="tab-btn">Terminal</button>
+      <button id="tab-journals" class="tab-btn">Journals</button>
+      <button id="tab-missions" class="tab-btn">Missions</button>
+      <button id="tab-artifacts" class="tab-btn">Artifacts</button>
+    </nav>
+    <main>
+      <section id="login-view" class="view">
+        <form id="login-form">
+          <input id="token-input" type="password" placeholder="Bearer token" autocomplete="off">
+          <button type="submit">Connect</button>
+          <p id="login-error" class="error hidden"></p>
+        </form>
+      </section>
+      <section id="terminal-view" class="view hidden">
+        <div id="thinking-terminal" class="terminal"></div>
+        <form id="captcha-form" class="hidden">
+          <p>Intervention required</p>
+          <iframe id="captcha-frame" src=""></iframe>
+          <button type="submit">Resolve</button>
+        </form>
+      </section>
+      <section id="journals-view" class="view hidden">
+        <div class="tabs">
+          <button class="tab active" data-tab="decisions">Decisions</button>
+          <button class="tab" data-tab="executions">Executions</button>
+        </div>
+        <div id="decisions-panel" class="panel"></div>
+        <div id="executions-panel" class="panel hidden"></div>
+      </section>
+      <section id="missions-view" class="view hidden">
+        <div id="telemetry">
+          <div class="gauge"><span>CPU</span><span id="g-cpu">0%</span></div>
+          <div class="gauge"><span>RAM</span><span id="g-ram">0%</span></div>
+          <div class="gauge"><span>Burn</span><span id="g-burn">0</span></div>
+          <div class="gauge"><span>Budget</span><span id="g-budget">0</span></div>
+        </div>
+        <form id="mission-form">
+          <textarea id="mission-prompt" placeholder="Mission prompt..." rows="4"></textarea>
+          <input id="mission-priority" type="number" value="0" min="0">
+          <input id="mission-budget" type="number" value="50000" min="1000">
+          <button type="submit">Start Mission</button>
+        </form>
+        <ul id="mission-list"></ul>
+      </section>
+      <section id="artifacts-view" class="view hidden">
+        <div id="artifacts-gallery"></div>
+      </section>
+    </main>
+  </div>
+  <script src="/pwa/app.js" type="module"></script>
+</body>
+</html>

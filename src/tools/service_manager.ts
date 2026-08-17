@@ -5,6 +5,7 @@ import { exec, execSync } from "node:child_process";
 import { promisify } from "node:util";
 import { EventEmitter } from "node:events";
 import * as dbHelper from "../utils/database_helper.js";
+import { validateAndResolvePath, ALLOWED_ROOTS } from "../utils/security_guard.js";
 
 const execAsync = promisify(exec);
 
@@ -52,37 +53,61 @@ export function registerServiceManagerTool(server: McpServer) {
     },
     async ({ target, action, isSystemDaemon }) => {
       try {
-        let command = "";
-
         if (isSystemDaemon) {
           if (action === "kill") {
             return { isError: true, content: [{ type: "text", text: "Action 'kill' is invalid for OpenRC. Use 'stop'." }] };
           }
-          command = `sudo rc-service ${target} ${action}`;
-        } else {
-          if (action === "status") {
-            command = `ps -ef | grep ${target} | grep -v grep`;
-          } else if (action === "kill" || action === "stop") {
-            command = `kill -9 ${target} 2>/dev/null || pkill -f ${target}`;
-          } else {
-            return { isError: true, content: [{ type: "text", text: `Action '${action}' requires custom shell execution for non-daemon processes.` }] };
-          }
+          const safeTarget = target.replace(/[^a-zA-Z0-9_-]/g, "");
+          const { stdout } = await execAsync(`sudo rc-service ${safeTarget} ${action}`, { timeout: 5000 });
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                status: "LIFECYCLE_ACTION_EXECUTED",
+                target_process: target,
+                action_taken: action,
+                system_output: stdout.trim() || "Execution completed with no standard output.",
+                warnings: "None"
+              }, null, 2)
+            }]
+          };
         }
 
-        const { stdout, stderr } = await execAsync(command, { timeout: 5000 });
+        if (action === "status") {
+          const { stdout } = await execAsync(`ps -ef`, { timeout: 5000 });
+          const matches = stdout.split("\n").filter(line => line.includes(target) && !line.includes("grep"));
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                status: matches.length > 0 ? "PROCESS_FOUND" : "PROCESS_NOT_FOUND",
+                target_process: target,
+                matches: matches.slice(0, 10)
+              }, null, 2)
+            }]
+          };
+        }
 
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({
-              status: "LIFECYCLE_ACTION_EXECUTED",
-              target_process: target,
-              action_taken: action,
-              system_output: stdout.trim() || "Execution completed with no standard output.",
-              warnings: stderr.trim() || "None"
-            }, null, 2)
-          }]
-        };
+        if (action === "kill" || action === "stop") {
+          const pid = parseInt(target, 10);
+          if (Number.isFinite(pid) && pid > 0) {
+            process.kill(pid, action === "kill" ? "SIGKILL" : "SIGTERM");
+            return {
+              content: [{
+                type: "text",
+                text: JSON.stringify({
+                  status: "SIGNAL_SENT",
+                  target_process: target,
+                  action_taken: action,
+                  signal: action === "kill" ? "SIGKILL" : "SIGTERM"
+                }, null, 2)
+              }]
+            };
+          }
+          return { isError: true, content: [{ type: "text", text: `Invalid PID: ${target}` }] };
+        }
+
+        return { isError: true, content: [{ type: "text", text: `Action '${action}' requires custom shell execution for non-daemon processes.` }] };
 
       } catch (error: any) {
         if (action === "status" && !isSystemDaemon) {

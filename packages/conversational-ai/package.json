@@ -1,0 +1,28 @@
+{
+  "name": "@kore-os/conversational-ai",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Level 2 personalized conversational AI layer for Kore OS. Detachable, standalone, PostgreSQL-backed.",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "simulate": "tsx src/simulation/runner.ts",
+    "migrate": "tsx src/db/migrate.ts",
+    "test": "tsx --test src/**/*.test.ts"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.11.1",
+    "dotenv": "^16.4.5",
+    "pg": "^8.11.3",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/pg": "^8.11.6",
+    "tsx": "^4.15.0",
+    "typescript": "^5.5.0"
+  }
+}

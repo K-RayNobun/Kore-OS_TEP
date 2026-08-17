@@ -5,6 +5,10 @@ export type IpcFrame = Record<string, unknown>;
 export type Broadcaster = (frame: IpcFrame) => void;
 export const IPC_SOCKET_PATH = "/tmp/kore-os.sock";
 
+function generateCorrelationId(): string {
+  return `${Date.now()}-${Math.random().toString(36).substring(2, 15)}`;
+}
+
 export class IpcPipe {
   private server: net.Server | null = null;
   private readonly clients = new Set<net.Socket>();
@@ -23,10 +27,17 @@ export class IpcPipe {
       socket.on("data", (data) => {
         const lines = data.toString().split("\n").filter((l) => l.trim());
         for (const line of lines) {
+          let frame: IpcFrame;
           try {
-            const frame = JSON.parse(line) as IpcFrame;
-            this.frameHandler?.(frame);
-          } catch {}
+            frame = JSON.parse(line) as IpcFrame;
+          } catch {
+            this.sendTo({ type: "nak", correlation_id: generateCorrelationId(), payload: { reason: "invalid_json" } }, null);
+            continue;
+          }
+          if ((frame as any).type !== "ack" && (frame as any).type !== "nak") {
+            this.sendTo({ type: "ack", correlation_id: (frame as any).correlation_id ?? generateCorrelationId() }, (frame as any).session_id);
+          }
+          this.frameHandler?.(frame);
         }
       });
     });
@@ -41,8 +52,12 @@ export class IpcPipe {
   }
 
   public send(frame: IpcFrame): void {
-    if (!this.server) return;
-    const payload = JSON.stringify(frame) + "\n";
+    this.sendTo(frame, null);
+  }
+
+  public sendTo(frame: IpcFrame, sessionId: string | null): void {
+    const correlationId = (frame as any).correlation_id || generateCorrelationId();
+    const payload = JSON.stringify({ ...frame, session_id: sessionId, correlation_id: correlationId }) + "\n";
     const deadClients: net.Socket[] = [];
     for (const client of Array.from(this.clients)) {
       try {
@@ -55,6 +70,14 @@ export class IpcPipe {
       this.clients.delete(client);
       client.destroy();
     }
+  }
+
+  public ack(correlationId: string, sessionId: string | null): void {
+    this.sendTo({ type: "ack", correlation_id: correlationId }, sessionId);
+  }
+
+  public nak(correlationId: string, reason: string, sessionId: string | null): void {
+    this.sendTo({ type: "nak", correlation_id: correlationId, payload: { reason } }, sessionId);
   }
 
   public stop(): void {

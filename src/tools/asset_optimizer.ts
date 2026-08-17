@@ -1,7 +1,7 @@
 // src/tools/asset_optimizer.ts
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { execFile, execSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import path from "node:path";
 import fs from "node:fs/promises";
@@ -17,7 +17,7 @@ export class AssetOptimizer {
         if (!CommandValidator.validateFFmpegArgs(args)) {
             throw new Error("Invalid FFmpeg profile");
         }
-        execSync(`ffmpeg ${args.join(' ')}`);
+        execFile("ffmpeg", args, { timeout: 60000 });
     }
 }
 
@@ -53,15 +53,15 @@ export function registerAssetOptimizerTool(server: McpServer) {
           outputFile
         );
 
-        await heavyTaskQueue.run(async () => {
+        const result = await heavyTaskQueue.run(async () => {
           const { stderr } = await execFileAsync("ffmpeg", ffmpegArgs, { timeout: 60000 });
-          
+
           const finalStats = await fs.stat(outputFile);
           const sizeMB = (finalStats.size / (1024 * 1024)).toFixed(2);
 
           return {
             content: [{
-              type: "text",
+              type: "text" as const,
               text: JSON.stringify({
                 status: "ASSET_OPTIMIZED",
                 original_file: resolvedInput,
@@ -74,22 +74,7 @@ export function registerAssetOptimizerTool(server: McpServer) {
           };
         });
 
-        const finalStats = await fs.stat(outputFile);
-        const sizeMB = (finalStats.size / (1024 * 1024)).toFixed(2);
-
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({
-              status: "ASSET_OPTIMIZED",
-              original_file: resolvedInput,
-              optimized_file: outputFile,
-              target_platform: platform,
-              final_size_mb: sizeMB,
-              render_warnings: "Clean render."
-            }, null, 2)
-          }]
-        };
+        return result as any;
 
       } catch (error: any) {
         return {

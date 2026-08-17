@@ -1,20 +1,30 @@
 // src/tools/backup.ts
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { execFile, execSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { ALLOWED_ROOTS, validateAndResolvePath } from "../utils/security_guard.js";
 
 const execFileAsync = promisify(execFile);
 
 const BACKUP_DIR = "/var/backups/elo-tep";
 
 export class BackupTool {
-    public createSnapshot(missionId: string): string {
-        const target = `${BACKUP_DIR}/${missionId}_${Date.now()}.tar.gz`;
-        execSync(`tar -czf ${target} /home/elo/workspace`);
-        return target;
+    public async createSnapshot(missionId: string, sourcePath: string): Promise<string> {
+        const resolvedSource = validateAndResolvePath(sourcePath, ALLOWED_ROOTS.WORKSPACE);
+        const safeName = `${missionId}_${Date.now()}.tar.gz`;
+        const fullBackupPath = path.join(BACKUP_DIR, safeName);
+
+        await fs.mkdir(BACKUP_DIR, { recursive: true });
+
+        const parentDir = path.dirname(resolvedSource);
+        const targetDirName = path.basename(resolvedSource);
+
+        await execFileAsync("tar", ["-czf", fullBackupPath, "-C", parentDir, targetDirName], { timeout: 15000 });
+
+        return fullBackupPath;
     }
 }
 
@@ -28,22 +38,18 @@ export function registerBackupTool(server: McpServer) {
     },
     async ({ sourcePath, backupName }) => {
       try {
-        const resolvedSource = path.resolve(sourcePath);
-        
-        // Clean the backup string to prevent command injection characters or directory traversal paths
+        const resolvedSource = validateAndResolvePath(sourcePath, ALLOWED_ROOTS.WORKSPACE);
+
         const safeName = backupName.replace(/[^a-zA-Z0-9_-]/g, "");
         const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
         const archiveFilename = `${safeName}_${timestamp}.tar.gz`;
         const fullBackupPath = path.join(BACKUP_DIR, archiveFilename);
 
-        // Ensure the backup storage directory exists securely
         await fs.mkdir(BACKUP_DIR, { recursive: true });
 
-        // Grab the base directory name and its parent path to ensure tar doesn't include massive absolute structures
         const parentDir = path.dirname(resolvedSource);
         const targetDirName = path.basename(resolvedSource);
 
-        // Run Alpine's native tar program to cleanly compress the filesystem slice
         await execFileAsync("tar", ["-czf", fullBackupPath, "-C", parentDir, targetDirName], { timeout: 15000 });
 
         const stats = await fs.stat(fullBackupPath);

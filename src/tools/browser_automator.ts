@@ -4,6 +4,7 @@ import { z } from "zod";
 import { heavyTaskQueue } from "../utils/task_queue.js";
 import { getSecureSessionContext } from "../utils/session_manager.js";
 import { sanitizeIngestedText, validateAndResolvePath, ALLOWED_ROOTS } from "../utils/security_guard.js";
+import { validateRemoteUrl } from "../utils/network_guard.js";
 import { SessionManager } from "../utils/session_manager.js";
 import path from "node:path";
 
@@ -12,9 +13,10 @@ export class BrowserAutomator {
 
     public async createMissionContext(missionId: string): Promise<any> {
         const playwright = await import("playwright" as any) as any;
-        const browser = await playwright.chromium.launch();
-        return await browser.newContext({
-            storageState: this.sessionMgr.getSessionDir(missionId) + '/state.json'
+        const secureContextPath = await getSecureSessionContext(missionId);
+        return await playwright.chromium.launchPersistentContext(secureContextPath, {
+            viewport: { width: 1280, height: 720 },
+            userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
         });
     }
 
@@ -33,16 +35,9 @@ export class BrowserAutomator {
       return heavyTaskQueue.run(async () => {
         try {
           const secureContextPath = await getSecureSessionContext(sessionProfile);
+          const validatedUrl = await validateRemoteUrl(url);
 
           const playwright = await import("playwright" as any) as any;
-           const browser = await playwright.chromium.launch({
-             headless: true,
-             args: [
-               "--disable-dev-shm-usage",
-               "--no-sandbox"
-             ]
-           });
-
            const context = await playwright.chromium.launchPersistentContext(secureContextPath, {
             viewport: { width: 1280, height: 720 },
             userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
@@ -50,7 +45,7 @@ export class BrowserAutomator {
 
           try {
             const page = await context.newPage();
-            await page.goto(url, { waitUntil: "domcontentloaded", timeout: 15000 });
+            await page.goto(validatedUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
 
             const pageTitle = await page.title();
 
@@ -75,7 +70,6 @@ export class BrowserAutomator {
             };
           } finally {
             await context.close();
-            await browser.close();
           }
         } catch (error: any) {
           return {
@@ -101,16 +95,9 @@ export function registerBrowserAutomatorTool(server: McpServer) {
       return heavyTaskQueue.run(async () => {
         try {
           const secureContextPath = await getSecureSessionContext(sessionProfile);
+          const validatedUrl = await validateRemoteUrl(url);
 
           const playwright = await import("playwright" as any) as any;
-           const browser = await playwright.chromium.launch({
-             headless: true,
-             args: [
-               "--disable-dev-shm-usage",
-               "--no-sandbox"
-             ]
-           });
-
            const context = await playwright.chromium.launchPersistentContext(secureContextPath, {
             viewport: { width: 1280, height: 720 },
             userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
@@ -118,7 +105,7 @@ export function registerBrowserAutomatorTool(server: McpServer) {
 
           try {
             const page = await context.newPage();
-            await page.goto(url, { waitUntil: "domcontentloaded", timeout: 15000 });
+            await page.goto(validatedUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
 
             const pageTitle = await page.title();
 
@@ -148,7 +135,6 @@ export function registerBrowserAutomatorTool(server: McpServer) {
             };
           } finally {
             await context.close();
-            await browser.close();
           }
         } catch (error: any) {
           return {

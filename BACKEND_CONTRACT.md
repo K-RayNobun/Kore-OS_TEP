@@ -1,235 +1,189 @@
-# Kore OS Control Center — Backend Contract (Frontend Assumption)
+# Kore OS Control Center — Backend Contract (Fleet / Multi-Mission)
 
-> **Purpose:** This document is the frontend's *assumed* contract with the Core Engine
-> gateway. It is derived verbatim from the actual frontend code (`src/App.tsx`,
-> `src/components/*`, `src/types.ts`) and from the two backend hand-off prompts already
-> sent. **If the backend team validates (or corrects) every section below, both sides are
-> on the same page.**
+> **Purpose:** Authoritative contract between the PWA frontend and the Core Engine gateway
+> (`src/server.ts`). Derived from the actual gateway implementation and the PWA handoff memo
+> (`1783723407821-PWA-HANDOFF-TO-BACKEND.md`). Endpoints that fail degrade to `null`/`[]` on the
+> client, so new endpoints can ship incrementally.
 >
-> Legend:
-> - **[ASSUMED]** — what the frontend currently expects; not yet explicitly confirmed by a backend response.
-> - **[CONFIRMED]** — stated in a backend response already received.
-> - **[GAP]** — a behavior that is undefined / unhandled and needs a decision.
+> Legend: **[IMPLEMENTED]** — the gateway returns this today. **[NEW]** — added by the backend
+> upgrade to satisfy the fleet PWA. All REST calls send `X-Kore-Core-Token`.
 
 ---
 
 ## 0. Connection model
 
-- **Gateway base URL** (`baseUrl`): user-entered in the login screen, stored in
-  `localStorage["kore_url"]`, default `https://vps-ip:3000`. All REST calls are rooted here.
-- **WebSocket URL**: derived in `App.tsx` as
-  `vpsUrl.replace(/^http/, 'ws') + "/api/v1/stream/cognition?token=" + encodeURIComponent(token)`.
-  - `https://…` → `wss://…`; `http://…` → `ws://…`. **[CONFIRMED]** backend accepts this path.
-- **CORS**: the frontend is (in dev) served from a *different* origin than the gateway
-  (e.g. `http://localhost:5173` vs gateway `:3000`). The frontend assumes the gateway sends
-  CORS headers permitting the PWA origin **and** the `X-Kore-Core-Token` request header.
-  **[CONFIRMED]** backend configures `KORE_CORS_ORIGIN` (default `http://localhost:5173`)
-  and allows that header.
-- **TLS / self-signed**: default URL uses `https://vps-ip:3000` (a literal placeholder). The
-  frontend makes no cert pinning or insecure-override; if the gateway uses a self-signed cert
-  the browser will block it and all calls fail. **[ASSUMED]** this is handled operationally.
+- **Gateway base URL** (`baseUrl`): user-entered in login, stored in `localStorage["kore_url"]`,
+  default `https://vps-ip:3000`. All REST calls are rooted here.
+- **WebSocket URL**: `baseUrl.replace(/^http/, 'ws') + "/api/v1/stream/cognition?token=" + token`
+  (and `/stream/intervention`). `https→wss`, `http→ws`.
+- **CORS**: gateway allows `KORE_CORS_ORIGIN` (default `http://localhost:5173`) + `http://localhost:3000`
+  and the `X-Kore-Core-Token` header.
+- **Auth**: `X-Kore-Core-Token` on every REST request; same token as `?token=` on WS. Invalid/missing
+  token → `401` on every route. `GET /api/v1/auth/verify` returns `200` when valid; the PWA bounces to
+  login on `401`.
+- **Repo layout**: repo-root `src/` is the **backend** (gateway + MCP engine + utils + tools). The PWA
+  is served from `src/pwa/` (or an external build mounted there). The backend is NOT built into the PWA.
 
 ---
 
-## 1. Authentication
+## 1. REST endpoints
 
-| Item | Detail |
-|------|--------|
-| REST auth header | `X-Kore-Core-Token: <token>` on **every** REST request. **[CONFIRMED]** |
-| WS auth | same token as query param `?token=<urlencoded>`. **[CONFIRMED]** |
-| Token storage | `localStorage["kore_token"]` (plaintext). **[ASSUMED]** acceptable for self-hosted panel. |
-| Invalid token | backend returns **401** on every route when `KORE_CORE_TOKEN` is set. **[CONFIRMED]** |
-| Login validation | **[GAP]** the "Link Core" button does **NOT** call any verify endpoint — it just stores
-  the token and enters the shell. The token is only ever validated implicitly when a real API
-  call returns 401. The frontend does **not** catch 401 to bounce the user back to the login
-  screen. |
-| `POST /api/v1/auth/verify` | **[CONFIRMED]** implemented by backend (returns 200 if token valid) but **[GAP]** currently
-  **unused** by the frontend. |
+### 1.1 Already-present fleet endpoints
 
----
+| Method & path | Use | Success response |
+|------|------|------------------|
+| `GET /api/v1/telemetry` | 3s poll → gauges | `{cpu, ramUsed, ramTotal, inputTokens, outputTokens, burnRate, ceilActive, budgetRemaining, budgetTotal}` |
+| `POST /api/v1/telemetry/budget` | toggle global brake | `{status, ceilActive}` |
+| `GET /api/v1/auth/verify` | login gate | `200` |
+| `GET /api/v1/decisions?missionId=` | journal (per mission) | `DecisionRecord[]` |
+| `GET /api/v1/processes` | process list | `ProcessRecord[]` |
+| `GET /api/v1/captcha/active` | poll fallback | `{id, url}` or `null`/204 |
+| `POST /api/v1/jobs/resume` | resolve intervention | `{status, taskId, approved}` (see §4) |
+| `GET /api/v1/missions/:id/artifacts` | gallery | `{mission_id, artifacts:[...]}` |
+| `GET /api/v1/artifacts/download/:id` | download | binary + headers |
+| `WS /api/v1/stream/cognition` | cognition frames | `{intent, rationale, session_id?}` |
+| `WS /api/v1/stream/intervention` | state/intervention frames | `{type, payload, session_id?}` (see §3) |
 
-## 2. REST endpoints
+### 1.2 NEW endpoints (degrade to `null`/`[]` if absent)
 
-### 2.1 `GET /api/v1/telemetry`  **[CONFIRMED]**
-- **Headers:** `X-Kore-Core-Token`.
-- **Polling:** every **3000 ms** (`setInterval` in `TelemetryGauges`).
-- **Response shape** (`TelemetryMetrics`):
-  ```json
-  {
-    "cpu":        <number 0–100>,
-    "ramUsed":    <number>,
-    "ramTotal":   <number, MUST be > 0>,
-    "inputTokens":  <number>,
-    "outputTokens": <number>,
-    "burnRate":   <number>,
-    "ceilActive": <boolean>
-  }
-  ```
-- **Frontend usage:**
-  - `cpu` rendered as a `%` bar.
-  - RAM bar = `round(ramUsed / ramTotal * 100)` → **`ramTotal` must be > 0 or this divides by zero.**
-  - "Daily Token Burn" label = `(inputTokens + outputTokens).toLocaleString()` + `" tx"`.
-  - `ceilActive` drives the toggle button text: `true` → `"Hard Ceiling ON"` (red),
-    `false` → `"Ceiling OFF"` (grey).
-- **Error handling:** **[ASSUMED]** on fetch failure the previous metrics are kept (no reset,
-  just `console.error`). Stale values remain visible.
+| Method & path | Body / query | Success | Maps to |
+|------|------|----------|---------|
+| `GET /api/v1/missions` | — | `Mission[]` (§2.1) | fleet board |
+| `POST /api/v1/missions/start` | `{prompt, missionId?, attributes}` | `{status, mission_id}` | launch sheet |
+| `POST /api/v1/missions/:id/pause` | `{}` | `{status, mission_id}` | |
+| `POST /api/v1/missions/:id/resume` | `{}` | `{status, mission_id}` | |
+| `POST /api/v1/missions/:id/cancel` | `{}` | `{status, mission_id}` | [NEW verb] |
+| `POST /api/v1/missions/:id/interrupt` | `{force?}` | `{status, mission_id}` | graceful interrupt |
+| `POST /api/v1/missions/:id/priority` | `{priority}` | `{status, mission_id, priority}` | |
+| `POST /api/v1/missions/:id/budget` | `{tokens}` | `{status, mission_id, tokens}` | |
+| `GET /api/v1/missions/:id/checkpoints` | — | `CheckpointRecord[]` | timeline |
+| `GET /api/v1/missions/:id/interruptions` | — | `InterruptionRecord[]` | timeline |
+| `GET /api/v1/missions/:id/state` | — | legacy state snapshot | |
+| `GET /api/v1/budget` | — | `BudgetPool` (§2.3) | budget bar |
+| `POST /api/v1/budget/refill` | `{tokens}` | `{status, remaining, totalAllocated}` | pool refill |
+| `GET /api/v1/budget/status` | — | `{remaining, totalAllocated}` | legacy |
+| `GET /api/v1/schedules` | — | `Schedule[]` (§2.4) | scheduler |
+| `POST /api/v1/schedules` | `Partial<Schedule>` | `{status, id}` | create |
+| `PATCH /api/v1/schedules/:id` | `Partial<Schedule>` | `{status, id}` | edit |
+| `DELETE /api/v1/schedules/:id` | — | `{status, id}` | remove |
+| `POST /api/v1/schedules/:id/toggle` | `{enabled}` | `{status, id, enabled}` | legacy toggle |
+| `GET /api/v1/policy` | — | `{weightUrgency, weightImportance, categoryBias, reservePct}` | priority preview |
+| `GET /api/v1/tags` | — | `string[]` | tag autocomplete |
 
-### 2.2 `POST /api/v1/telemetry/budget`  **[CONFIRMED]**
-- **Headers:** `Content-Type: application/json`, `X-Kore-Core-Token`.
-- **Request body:** **NONE** is sent by the frontend.
-- **Server effect:** **[CONFIRMED]** toggles and persists `ceilActive` (to `budget.json`).
-- **Frontend assumption:** after the POST, the frontend **optimistically flips** its local
-  `ceilActive` (`setMetrics(m => ({...m, ceilActive: !m.ceilActive}))`) and does **not** read
-  the response. The next `GET /telemetry` (≤3 s later) is expected to confirm the new value.
-  - **[GAP]** if the POST fails, the UI shows the flipped (wrong) state until the next poll
-    corrects it. Frontend ignores HTTP status / body entirely.
-
-### 2.3 `GET /api/v1/decisions`  **[CONFIRMED]**
-- **Headers:** `X-Kore-Core-Token`.
-- **Fetch timing:** **once on mount** (no polling).
-- **Response shape** (`DecisionRecord[]`):
-  ```json
-  [ { "id": "<string>", "thought": "<string>",
-      "action": "<string|null>", "execution_logs": "<string|null>" } ]
-  ```
-- **Frontend usage:** left pane lists decisions (`id`, `thought`, `action`). Clicking one shows
-  its `execution_logs` in the right pane. Missing `action`/`execution_logs` render as
-  `"None (Reflection)"` / `"No stdout/stderr records emitted…"`.
-- **[ASSUMED]** `id` is a string; array may be empty `[]`.
-
-### 2.4 `GET /api/v1/processes`  **[CONFIRMED]**
-- **Headers:** `X-Kore-Core-Token`.
-- **Fetch timing:** **once on mount** (alongside decisions).
-- **Response shape** (`ProcessRecord[]`):
-  ```json
-  [ { "name": "<string>", "status": "RUNNING" | "STOPPED" | "<string>" } ]
-  ```
-- **Frontend usage:** right pane (when no decision selected) lists processes; `status ===
-  "RUNNING"` → green, anything else → red.
-
-### 2.5 `POST /api/v1/jobs/resume`  **[CONFIRMED]**
-- **Headers:** `Content-Type: application/json`, `X-Kore-Core-Token`.
-- **Request body:** `{ "sessionId": "<string>" }`.
-- **Triggers (two):**
-  1. **Manual** "Release Worker" button → `sessionId = activeCaptcha.id`.
-  2. **postMessage** from the `/interactive` iframe → `sessionId = message.taskId`
-     (see §4).
-- **Server effect:** **[CONFIRMED]** accepts `sessionId`, maps it to `taskId` internally,
-  forwards the human directive via the IPC pipe.
-- **Frontend on success:** calls `onResolved()` → `App` sets `activeCaptcha = null` (overlay
-  closes).
-- **[GAP]** on HTTP error the overlay is **not** closed (stays open, button re-enabled). No
-  retry.
-
-### 2.6 `GET /api/v1/captcha/active`  **[CONFIRMED]**
-- **Headers:** `X-Kore-Core-Token`.
-- **Polling:** every **3000 ms** in `App.tsx`, only while authenticated.
-- **Response when an intercept is pending:**
-  ```json
-  { "id": "<string>", "url": "<absolute url>" }
-  ```
-  - **[CONFIRMED]** `id` is the plain task-number string (e.g. `"42"`), directly usable as
-    `sessionId` in `jobs/resume`.
-  - **[CONFIRMED]** `url` is an **absolute** URL built from the request host and **already
-    includes** `&interactive=true&showControls=true`. The frontend uses it verbatim as the
-    iframe `src` (it must **NOT** append those params again).
-- **Response when none active:** HTTP 200 with JSON body `null`, **or** HTTP 204 with no body.
-  - Frontend: `res.status === 204` → ignored; JSON `null` → ignored; only a truthy
-    `{id, url}` opens the overlay.
-- **[CONFIRMED critical guarantee]** after `jobs/resume` is accepted for that session, this
-  endpoint **MUST** subsequently return `null` (so the overlay closes and does **not**
-  immediately reopen on the next 3 s poll).
-- **Frontend opening logic:** only *opens* (`setActiveCaptcha`); the poll never *closes* it.
-  Closing happens only via `onResolved`.
+> The PWA sends **semantic mission attributes** on `POST /missions/start` and the engine **owns the
+> canonical priority** (computed from `urgency`/`importance`/`category`, see `GET /policy`). A raw
+> `priority` integer is still accepted as a fallback. Recurring attributes create a linked schedule.
 
 ---
 
-## 3. WebSocket — `GET /api/v1/stream/cognition?token=…`  **[CONFIRMED]**
+## 2. Response shapes (camelCase — serialized at the API boundary)
 
-- **Connection:** opened in `ThinkingFeed` on mount (re-created if `wsUrl`/`token` change).
-- **Auth:** 401 if no/invalid `?token=`. **[CONFIRMED]**
-- **Initial frame on connect:** `{ "intent": "Idle", "rationale": "" }`. **[CONFIRMED]**
-- **Subsequent frames** (`CognitionFrame`):
-  ```json
-  { "intent": "<string>", "rationale": "<string>" }
-  ```
-- **Frontend handling:** `ws.onmessage` does `JSON.parse(event.data)` and `setFeed(data)`.
-  The latest frame **replaces** the previous one (no history/scrollback buffer beyond the
-  current frame).
-- **[ASSUMED / IMPORTANT]** **every** message on this socket is a `CognitionFrame`. There is
-  **no `type` discriminator**. If the backend ever sends a different message shape here, the
-  frontend will mis-render it as `{intent, rationale}`.
-- **[GAP]** no reconnect logic; on `ws.onerror` it only `console.error`s. A dropped socket
-  leaves the last frame on screen with no "disconnected" indicator.
+### 2.1 `Mission` (from `GET /api/v1/missions`)
+```jsonc
+{
+  "missionId": "mission-1699",
+  "prompt": "…",
+  "status": "RUNNING",            // QUEUED|RUNNING|PAUSED|AWAITING_HUMAN|INTERRUPTED|CANCELLED|COMPLETED|FAILED|CHECKPOINTING
+  "priority": 42,
+  "attributes": { "urgency": 0, "importance": 0, "category": "standard", "tags": [], "recurrence": {"kind":"none"} },
+  "budgetAllocated": 80000,
+  "budgetConsumed": 1234,
+  "tasksTotal": 12,
+  "tasksDone": 3,
+  "preemptedBy": null,
+  "lastCognition": "INTENT: …",
+  "latestCheckpointIteration": 42,
+  "queuedAt": "…", "startedAt": "…", "completedAt": "…"
+}
+```
 
----
+### 2.2 `CheckpointRecord` / `InterruptionRecord`
+```jsonc
+// checkpoints
+{ "id": 1, "missionId": "m1", "taskId": null, "loopIteration": 42, "createdAt": "…" }
+// interruptions
+{ "id": 1, "missionId": "m1", "taskId": null, "reason": "…", "toolPid": null, "cleanupStatus": "PENDING", "createdAt": "…" }
+```
 
-## 4. CAPTCHA / 2FA intercept flow (end-to-end)
+### 2.3 `BudgetPool` (from `GET /api/v1/budget`)
+```jsonc
+{
+  "totalTokens": 500000,
+  "consumedTokens": 120000,
+  "reserveTokens": 50000,
+  "allocations": [{ "missionId": "m1", "allocated": 80000, "consumed": 12000 }],
+  "burnRatePerMin": 1500,
+  "ceilActive": false
+}
+```
 
-This is the full assumed sequence; **[CONFIRMED]** where the backend response agrees.
-
-1. Backend detects an intercept → `GET /api/v1/captcha/active` returns `{id, url}`.
-2. Frontend poll (§2.6) opens `InteractiveCanvas` overlay with `sessionId = id`,
-   `debugUrl = url`.
-3. Overlay renders a sandboxed `<iframe src={url}>` with
-   `sandbox="allow-scripts allow-same-origin allow-forms"`.
-4. The `/interactive` page (**served by backend, auth-exempt**) lets the human solve the
-   puzzle. **[CONFIRMED]** `GET /interactive` is public (no `X-Kore-Core-Token` required).
-5. When solved, `/interactive` calls `window.parent.postMessage({ type: "resume", taskId,
-   approved }, "*")`. **[CONFIRMED]**
-6. **Frontend listener** (`window.addEventListener("message")` in `InteractiveCanvas`):
-   - Validates `event.origin === new URL(baseUrl).origin` (ignores messages from other
-     origins). **[ASSUMED]** the iframe's origin equals the gateway origin.
-   - If `data.type === "resume"` → calls `resumeWorker(data.taskId ?? sessionId)`.
-7. `resumeWorker` → `POST /api/v1/jobs/resume` with `{ sessionId: String(taskId) }` → on
-   success `onResolved()` closes the overlay.
-8. **Manual fallback:** the "Puzzle Resolved - Release Worker" button also calls
-   `resumeWorker(sessionId)` with the overlay's `id`. **[ASSUMED]** this remains valid even
-   though the primary path is the postMessage.
-9. After resume, `captcha/active` returns `null` (§2.6 guarantee) so the overlay stays closed.
-
----
-
-## 5. PWA shell (static, not backend-served)
-
-- `public/manifest.json` — name `Kore OS Control Center`, icons `icon-192.png` / `icon-512.png`.
-- `public/sw.js` — service worker registered in `main.tsx`. Contains install/activate/push/
-  notificationclick handlers.
-- **[GAP]** Web Push handlers exist but there is **no** VAPID/subscription wiring on the
-  frontend, and push is **not** used to trigger the captcha overlay (we use the REST poll in
-  §2.6). If Web Push is desired for "intervention alerts," a subscription endpoint + frontend
-  registration must still be designed.
-
----
-
-## 6. Field-type invariants (must hold or UI breaks)
-
-- All numeric telemetry fields are JSON **numbers**, not strings.
-- `ramTotal > 0`.
-- `id` fields are **strings** (decisions, captcha).
-- Arrays (`decisions`, `processes`) are JSON arrays (empty `[]` allowed).
-- `captcha/active` pending response is exactly `{ "id": string, "url": string }`; idle is
-  `null` (200) or 204.
+### 2.4 `Schedule` (from `GET /api/v1/schedules`)
+```jsonc
+{
+  "id": 1,
+  "name": "Daily health audit",
+  "prompt": null,
+  "cronExpr": "0 6 * * *",
+  "intervalMinutes": null,
+  "nextTriggerAt": "…",
+  "enabled": true,
+  "priorityOverride": 30,
+  "budgetAllocatedTokens": 10000,
+  "maxConcurrentRuns": 1,
+  "lastStatus": "SUCCESS",   // SUCCESS|FAILED|SKIPPED  ← SKIPPED = budget-exhausted, rendered amber
+  "lastRunAt": "…",
+  "attributes": null
+}
+```
 
 ---
 
-## 7. Open questions for the backend (need decisions)
+## 3. WebSocket — intervention socket (`/stream/intervention`)
 
-1. **Rejection path:** when `/interactive` emits `approved: false`, what should happen?
-   Frontend currently only acts on `type: "resume"`. Should a rejection (a) just close the
-   overlay, (b) POST a rejection to a new endpoint (e.g. `/api/v1/jobs/reject`), or (c)
-   something else?
-2. **Intercept lifetime:** if the human never solves it, does `captcha/active` keep returning
-   the same `id` forever? Is there an expiry/timeout after which it auto-clears?
-3. **401 UX:** frontend does not currently bounce to login on 401. Should it? (Affects whether
-   `auth/verify` should be called at login.)
-4. **WS resilience:** no reconnect on drop — acceptable, or should the frontend attempt
-   reconnect?
-5. **Mixed message types on cognition socket:** confirmed the socket is cognition-only; if any
-   other message type will ever be sent there, the contract needs a `type` discriminator.
+Frames carry a `type` discriminator + optional `session_id`. Unknown types are ignored.
+
+| `type` | `payload` | Meaning |
+|--------|-----------|---------|
+| `state_change` | `{state, mission_id, task_id?}` | mission status changed |
+| `intervention_request` | `{intervention_type:'captcha'|'clarification', task_id?, url?, question?, choices?:string[]}` | enqueue intervention |
+| `artifact_manifest` | `{artifacts:[...]}` | new artifacts |
+| `mission_update` | `{missions: Mission[]}` | full fleet upsert (live board) |
+| `budget_update` | `{pool: BudgetPool}` | pool changed |
+| `checkpoint` | `{mission_id, loop_iteration?}` | timeline entry |
+| `interruption` | `{mission_id, reason?, tool?, cleanup_ok?}` | timeline + alert |
+| `tool_execution` | `{mission_id, tool, status}` | timeline |
+| `alert` | `{severity:'info'|'warning'|'critical', message, mission_id?}` | notification center |
+
+The **cognition socket** (`/stream/cognition`) accepts both `{intent, rationale}` (routed to
+`missionId:'global'`) and `{intent, rationale, session_id}` (routed to that mission). `session_id`
+is emitted where available; otherwise frames land in the global stream.
 
 ---
 
-*End of contract. Backend: validate each `[ASSUMED]`/`[GAP]` item; correct any mismatch and
+## 4. `POST /api/v1/jobs/resume` (intervention resolution)
 
-the frontend will be adjusted accordingly.*
+Body is one of:
+```jsonc
+{ "sessionId": "42", "approved": true }                       // approve (legacy)
+{ "sessionId": "42", "approved": false }                      // reject / give up
+{ "sessionId": "42", "approved": true, "choice": "Link B" }  // clarification choice
+{ "sessionId": "42", "approved": true, "answer": "use v2" }  // free-text answer
+```
+The gateway maps `sessionId→taskId`, forwards a `human_directive` IPC frame (with `choice`/`answer`
+threaded in), and on `approved:false` records a `REJECTED` `human_interventions` row. **The path is
+kept** (`/jobs/resume`), not renamed to `/intervention/respond`.
+
+---
+
+## 5. Field-type invariants
+
+- Telemetry numbers are JSON numbers; `ramTotal > 0`.
+- `id` fields are strings; arrays are JSON arrays (empty `[]` allowed).
+- `captcha/active` pending = `{id, url}`; idle = `null` (200) or 204.
+- `Schedule.lastStatus: "SKIPPED"` is an operational signal (budget exhausted), not a failure.
+- `Mission.status` accepts the extended set above (incl. `CANCELLED`, `INTERRUPTED`, `AWAITING_HUMAN`).
+
+---
+
+*Supersedes the earlier single-mission `BACKEND_CONTRACT.md`. The backend is the source of truth; the
+PWA degrades gracefully for any endpoint not yet returned.*

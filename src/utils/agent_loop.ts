@@ -22,6 +22,21 @@ export interface AgentLoopResult {
   missionId: string;
   completed: boolean;
   summary: string;
+  cancelled?: boolean;
+}
+
+const abortRequests = new Set<string>();
+
+export function requestMissionAbort(missionId: string): void {
+  abortRequests.add(missionId);
+}
+
+export function clearMissionAbort(missionId: string): void {
+  abortRequests.delete(missionId);
+}
+
+function isMissionAborted(missionId: string): boolean {
+  return abortRequests.has(missionId);
 }
 
 const SCHEMA_NAME_MAP: Record<string, string> = {
@@ -225,12 +240,19 @@ Emits ONLY valid JSON:
     initialState: TaskStateFile,
     microSteps: MicroStep[],
     retryEvents: RetryEvent[]
-  ): Promise<{ completed: boolean }> {
+  ): Promise<{ completed: boolean; cancelled?: boolean }> {
     let state = initialState;
     let steps = 0;
 
     while (steps < this.maxStepsPerTask) {
       steps++;
+      if (isMissionAborted(missionId)) {
+        console.error("[AGENT_LOOP] Abort requested for mission", { missionId });
+        this.ipcBroadcaster?.({ type: "interruption", payload: { mission_id: missionId, reason: "operator_cancel" } });
+        this.stateBroadcaster?.({ state: "CANCELLED", mission_id: missionId });
+        clearMissionAbort(missionId);
+        return { completed: false, cancelled: true };
+      }
       const loopStart = Date.now();
 
       let skeletonInjection: MicroStep["skeleton_injection"] = undefined;

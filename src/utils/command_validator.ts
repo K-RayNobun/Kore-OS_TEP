@@ -19,12 +19,17 @@ export const getFfmpegArgsForProfile = (profile: OptimizeProfile, input: string,
 
 export class CommandValidator {
     private static readonly ALLOWED_FFMPEG_FLAGS = new Set([
-        '-i', '-vcodec', '-acodec', '-preset', '-crf', '-y'
+        '-i', '-vcodec', '-acodec', '-preset', '-crf', '-y',
+        '-vf', '-af', '-movflags', '-pix_fmt', '-b:v', '-b:a',
+        '-s', '-r', '-ar', '-ac', '-map', '-metadata', '-shortest',
+        '-frames:v', '-qscale:v', '-c:v', '-c:a', '-profile:v',
+        '-level', '-movflags', '-faststart', '-g', '-keyint_min'
     ]);
 
     public static validateFFmpegArgs(args: string[]): boolean {
         const metaPattern = /[;&|><$]/;
         if (args.some(arg => metaPattern.test(arg))) return false;
+        if (args.some(arg => arg === '-i' && args.indexOf(arg) < args.length - 1 && args[args.indexOf(arg) + 1]?.startsWith('http'))) return false;
 
         return args.every(arg => 
             !arg.startsWith('-') || this.ALLOWED_FFMPEG_FLAGS.has(arg)

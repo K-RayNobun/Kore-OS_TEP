@@ -33,7 +33,8 @@ RUN apk add --no-cache \
     freetype \
     harfbuzz \
     ca-certificates \
-    ttf-freefont
+    ttf-freefont \
+    curl
 
 # Create the dedicated, non-root operational user and group
 RUN addgroup -g 1001 elo && \
@@ -44,7 +45,8 @@ RUN mkdir -p /home/elo/workspace \
              /home/elo/data \
              /home/elo/.cache/ms-playwright \
              /home/elo/.local/share/browser-context \
-             /usr/src/app
+             /usr/src/app/pwa \
+             /tmp
 
 WORKDIR /usr/src/app
 
@@ -60,6 +62,7 @@ COPY package*.json ./
 # inside its own spaces, while explicitly sealing off session storage (chmod 700).
 RUN chown -R elo:elo /home/elo && \
     chown -R elo:elo /usr/src/app && \
+    chown -R elo:elo /tmp && \
     chmod 755 /home/elo/workspace && \
     chmod 755 /home/elo/data && \
     chmod 700 /home/elo/.local/share/browser-context
@@ -74,4 +77,12 @@ RUN npx playwright install chromium
 # Expose any internal port used by your JSON-RPC or MCP server communication layer
 EXPOSE 3000
 
+# Production runtime notes (apply at docker run / compose level):
+#   --read-only
+#   --tmpfs /tmp:size=512m
+#   --security-opt no-new-privileges:true
+#   --cap-drop ALL --cap-add NET_BIND_SERVICE
+#   --security-opt seccomp=./docker/seccomp-profile.json
+#   --healthcheck CMD ["/docker/healthcheck.sh"]
+#   -v kore-marketing-metrics:/home/elo/data
 CMD ["node", "dist/index.js"]

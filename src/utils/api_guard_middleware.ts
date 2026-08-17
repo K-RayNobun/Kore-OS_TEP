@@ -29,6 +29,15 @@ export class ApiGuardMiddleware {
         this.loadKeyPool();
     }
 
+    public estimateTokens(text: string): number {
+        return Math.ceil(text.length / 4);
+    }
+
+    public gatePromptByTokenBudget(prompt: string, systemPrompt: string, maxTokens = 1000): boolean {
+        const total = this.estimateTokens(systemPrompt + prompt);
+        return total <= maxTokens;
+    }
+
     private loadKeyPool() {
         const configPath = process.env.KORE_API_POOL_PATH || path.join(process.cwd(), 'config', 'api_pool.json');
         if (fs.existsSync(configPath)) {

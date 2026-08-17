@@ -1,46 +1,20 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { spawn } from "node:child_process";
+import { sandboxRunner } from "../utils/sandbox_runner.js";
 import { SecurityGuard } from "../utils/security_guard.js";
 
 export class SecureSandbox {
     private guard = new SecurityGuard();
 
-    public runIsolatedBinary(binaryPath: string, args: string[] = [], timeoutMs = 10000): Promise<string> {
-        return new Promise((resolve, reject) => {
-            try {
-                const safePath = this.guard.validateAndResolvePath(binaryPath);
-                
-                const processInstance = spawn(safePath, args, {
-                    cwd: '/tmp',
-                    env: { PATH: '/usr/bin:/bin' },
-                    shell: false
-                });
-
-                let stdoutAccumulator = '';
-                let stderrAccumulator = '';
-
-                const killTimer = setTimeout(() => {
-                    processInstance.kill('SIGKILL');
-                    reject(new Error(`[SANDBOX_TIMEOUT] Execution forced kill after ${timeoutMs}ms`));
-                }, timeoutMs);
-
-                processInstance.stdout!.on('data', (data) => { stdoutAccumulator += data.toString(); });
-                processInstance.stderr!.on('data', (data) => { stderrAccumulator += data.toString(); });
-
-                processInstance.on('close', (code) => {
-                    clearTimeout(killTimer);
-                    if (code !== 0) {
-                        reject(new Error(`[SANDBOX_FAILURE] Process exited with code ${code}. Stderr: ${stderrAccumulator}`));
-                    } else {
-                        resolve(stdoutAccumulator.trim());
-                    }
-                });
-
-            } catch (error) {
-                reject(error);
-            }
+    public runIsolatedBinary(binaryPath: string, args: string[] = [], options: { cpuTimeMs?: number; memoryMb?: number } = {}): Promise<string> {
+        const safePath = this.guard.validateAndResolvePath(binaryPath);
+        
+        const result = sandboxRunner.run(safePath, args, {
+            cpuTimeMs: options.cpuTimeMs || 10000,
+            memoryMb: options.memoryMb || 512
         });
+
+        return result.promise;
     }
 }
 
@@ -56,7 +30,7 @@ export function registerSandboxTool(server: McpServer) {
         },
         async ({ binaryPath, args, timeoutMs }) => {
           try {
-            const output = await sandbox.runIsolatedBinary(binaryPath, args, timeoutMs);
+            const output = await sandbox.runIsolatedBinary(binaryPath, args, { cpuTimeMs: timeoutMs });
             return {
               content: [{
                 type: "text",

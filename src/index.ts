@@ -18,7 +18,7 @@ import { registerPlaybookCompilerTool, PlaybookCompiler } from "./tools/playbook
 import { registerBrowserAutomatorTool } from "./tools/browser_automator.js";
 import { registerMetricsLedgerTool, MetricsLedger } from "./tools/metrics_ledger.js";
 import { registerAgentLoopTool, setAgentLoopStateBroadcaster } from "./tools/agent_loop_tool.js";
-import { AgentLoop } from "./utils/agent_loop.js";
+import { AgentLoop, requestMissionAbort } from "./utils/agent_loop.js";
 import { ApiGuardMiddleware } from "./utils/api_guard_middleware.js";
 import { GitAutomationHelper } from "./utils/git_automation_helper.js";
 import { RecursiveRealizationEngine } from "./utils/realization_engine.js";
@@ -27,11 +27,24 @@ import { IpcPipe } from "./utils/ipc_pipe.js";
 import type { IpcFrame } from "./utils/ipc_pipe.js";
 import { EngineStateMachine } from "./utils/state_machine.js";
 import * as dbHelper from "./utils/database_helper.js";
+import { BudgetPool } from "./utils/budget_pool.js";
+import { SchedulerDaemon } from "./utils/scheduler.js";
+import { InterruptionHandler } from "./utils/interruption_handler.js";
+import { PriorityQueue } from "./utils/priority_queue.js";
+import { ResourceGuard } from "./utils/resource_guard.js";
+import { MigrationRunner } from "./utils/migrations.js";
+import { Heartbeat } from "./utils/heartbeat.js";
+import { ImplicationStore } from "./utils/implication_store.js";
 
 const ipcPipe = new IpcPipe();
 const stateMachine = new EngineStateMachine(ipcPipe.send.bind(ipcPipe));
-setAgentLoopStateBroadcaster((state) => stateMachine.setGlobalState(state.state as any));
-const runningMissions = new Map<string, { agentLoop: any; cancel?: () => void }>();
+setAgentLoopStateBroadcaster((state) => stateMachine.setMissionState((state as any).mission_id || "unknown", state.state as any, state as any));
+
+const budgetPool = new BudgetPool();
+const priorityQueue = new PriorityQueue(budgetPool, ipcPipe);
+const scheduler = new SchedulerDaemon(ipcPipe, priorityQueue, budgetPool);
+const interruptionHandler = new InterruptionHandler(ipcPipe, budgetPool);
+const resourceGuard = new ResourceGuard();
 
 const server = new McpServer({
   name: "kore-os-TEP",
@@ -47,6 +60,32 @@ const purgeEngine = new EphemeralContentPurgeEngine();
 
 const activeTimers = new Map<number, NodeJS.Timeout>();
 const prePivotHashes = new Map<number, string>();
+const activeMissionSessions = new Map<string, { sessionId: string; priority: number }>();
+const missionTaskProgress = new Map<string, { total: number; done: number }>();
+
+function makeBroadcaster(sessionId: string, missionId: string) {
+  return (frame: any) => {
+    ipcPipe.sendTo(frame, sessionId);
+    if (!frame || !frame.type) return;
+    if (frame.type === "thinking") {
+      const p = frame.payload || {};
+      const cognition = `INTENT: ${p.action || p.thought || ""}`.slice(0, 280);
+      dbHelper.setMissionLastCognition(missionId, cognition);
+    } else if (frame.type === "checkpoint") {
+      const iter = frame.payload?.loop_iteration;
+      if (typeof iter === "number") dbHelper.setMissionLatestCheckpointIteration(missionId, iter);
+    } else if (frame.type === "mission_start") {
+      const total = Number(frame.payload?.tasks_count ?? 0);
+      missionTaskProgress.set(missionId, { total, done: 0 });
+      dbHelper.setMissionTasksProgress(missionId, total, 0);
+    } else if (frame.type === "task_start") {
+      const prog = missionTaskProgress.get(missionId) || { total: 0, done: 0 };
+      prog.done = prog.done + 1;
+      missionTaskProgress.set(missionId, prog);
+      dbHelper.setMissionTasksProgress(missionId, prog.total, prog.done);
+    }
+  };
+}
 
 async function commitAndLogIterationProgress(taskId: number, stateMsg: string): Promise<void> {
     const currentBranch = gitHelper.getCurrentBranch();
@@ -270,57 +309,261 @@ async function invokeEloquentEducatorLLM(rawLogs: string): Promise<string> {
 }
 
 async function bootstrapAvailableTasks(): Promise<void> {
-  const availableTasks = serviceManager.getAvailableTasks();
-  for (const task of availableTasks) {
-    executeTask(task);
+  const queued = dbHelper.getNextQueuedMission();
+  if (!queued) {
+    const availableTasks = serviceManager.getAvailableTasks();
+    for (const task of availableTasks) {
+      executeTask(task);
+    }
   }
 }
 
-async function handlePromptSubmit(missionIdHint: string | undefined, prompt: string): Promise<void> {
-  console.error("[ENGINE] handlePromptSubmit ENTER", { missionIdHint, prompt });
-  const missionId = missionIdHint || `mission-${Date.now()}`;
-  dbHelper.createMission(missionId, prompt);
-  dbHelper.updateMissionStatus(missionId, "ACTIVE");
-  stateMachine.setMissionState(missionId, "RUNNING");
+async function resumeInterruptedMissions(): Promise<void> {
+  const paused = dbHelper.getPausedMissions();
+  for (const entry of paused) {
+    console.error("[ENGINE] Resuming paused mission from checkpoint", { missionId: entry.mission_id });
+    const sessionId = entry.mission_id;
+    const agentLoop = new AgentLoop(apiGuard, makeBroadcaster(sessionId, entry.mission_id), (state) => {
+      stateMachine.setMissionState(entry.mission_id, state.state as any, { mission_id: entry.mission_id });
+    });
+    activeMissionSessions.set(entry.mission_id, { sessionId, priority: entry.priority });
+    priorityQueue.enqueue(entry.mission_id, entry.priority);
+    scheduler.notifyNewMission();
+    try {
+      const result = await priorityQueue.runMission(entry.mission_id, agentLoop, entry.mission_id, true);
+      if (result.cancelled) {
+        dbHelper.updateMissionStatus(entry.mission_id, "CANCELLED", new Date().toISOString());
+        dbHelper.updateMissionQueueStatus(entry.mission_id, "CANCELLED", { completedAt: new Date().toISOString() });
+      } else {
+        stateMachine.resolveMission(entry.mission_id);
+        dbHelper.updateMissionStatus(entry.mission_id, result.completed ? "COMPLETED" : "FAILED", new Date().toISOString());
+        dbHelper.updateMissionQueueStatus(entry.mission_id, result.completed ? "COMPLETED" : "FAILED", { completedAt: new Date().toISOString() });
+      }
+      budgetPool.release(entry.mission_id);
+    } catch (error) {
+      console.error(`[MISSION] ${entry.mission_id} resume failed:`, error);
+      stateMachine.resolveMission(entry.mission_id);
+      dbHelper.updateMissionStatus(entry.mission_id, "FAILED");
+      dbHelper.updateMissionQueueStatus(entry.mission_id, "FAILED", { completedAt: new Date().toISOString() });
+      budgetPool.release(entry.mission_id);
+    } finally {
+      activeMissionSessions.delete(entry.mission_id);
+      missionTaskProgress.delete(entry.mission_id);
+      priorityQueue.dequeue(entry.mission_id);
+    }
+  }
+}
 
-  const agentLoop = new AgentLoop(apiGuard, ipcPipe.send.bind(ipcPipe), (state) => {
+async function handlePromptSubmit(missionIdHint: string | undefined, prompt: string, priority: number = 0, budgetTokens: number = 50000): Promise<void> {
+  console.error("[ENGINE] handlePromptSubmit ENTER", { missionIdHint, prompt, priority, budgetTokens });
+  const missionId = missionIdHint || `mission-${Date.now()}`;
+  const sessionId = missionId;
+
+  const budgetEntry = dbHelper.getMissionQueueEntry(missionId);
+  const ceilActive = (budgetEntry?.status === 'PAUSED') || false;
+  if (!budgetPool.gateMissionSpawn(ceilActive)) {
+    console.error("[ENGINE] Mission spawn gated by budget pool", { missionId });
+    ipcPipe.sendTo({ type: "state_change", payload: { state: "QUEUED", mission_id: missionId, detail: "budget_exhausted" } }, sessionId);
+    return;
+  }
+
+  dbHelper.createMission(missionId, prompt);
+  dbHelper.createMissionQueueEntry({ missionId, priority, budgetAllocatedTokens: budgetTokens });
+  dbHelper.updateMissionStatus(missionId, "ACTIVE");
+  const allocated = budgetPool.allocate(missionId, budgetTokens);
+  if (!allocated) {
+    console.error("[ENGINE] Budget allocation refused", { missionId, budgetTokens });
+    ipcPipe.sendTo({ type: "state_change", payload: { state: "QUEUED", mission_id: missionId, detail: "budget_allocation_refused" } }, sessionId);
+    return;
+  }
+  activeMissionSessions.set(missionId, { sessionId, priority });
+
+  const agentLoop = new AgentLoop(apiGuard, makeBroadcaster(sessionId, missionId), (state) => {
     stateMachine.setMissionState(missionId, state.state as any, { mission_id: missionId });
   });
 
-  runningMissions.set(missionId, { agentLoop });
+  priorityQueue.enqueue(missionId, priority);
+  scheduler.notifyNewMission();
 
   try {
-    const result = await agentLoop.executeMission(prompt, missionId);
-    if (result.completed) {
+    const result = await priorityQueue.runMission(missionId, agentLoop, prompt);
+    if (result.cancelled) {
+      dbHelper.updateMissionStatus(missionId, "CANCELLED", new Date().toISOString());
+      dbHelper.updateMissionQueueStatus(missionId, "CANCELLED", { completedAt: new Date().toISOString() });
+    } else {
       stateMachine.resolveMission(missionId);
-      dbHelper.updateMissionStatus(missionId, "COMPLETED", new Date().toISOString());
+      dbHelper.updateMissionStatus(missionId, result.completed ? "COMPLETED" : "FAILED", new Date().toISOString());
+      dbHelper.updateMissionQueueStatus(missionId, result.completed ? "COMPLETED" : "FAILED", { completedAt: new Date().toISOString() });
     }
+    budgetPool.release(missionId);
   } catch (error) {
     console.error(`[MISSION] ${missionId} failed:`, error);
     stateMachine.resolveMission(missionId);
     dbHelper.updateMissionStatus(missionId, "FAILED");
+    dbHelper.updateMissionQueueStatus(missionId, "FAILED", { completedAt: new Date().toISOString() });
+    budgetPool.release(missionId);
   } finally {
-    runningMissions.delete(missionId);
+    activeMissionSessions.delete(missionId);
+    missionTaskProgress.delete(missionId);
+    priorityQueue.dequeue(missionId);
   }
 }
 
+function registerInterruptionContracts(): void {
+  interruptionHandler.registerToolContract("browser_automator", {
+    graceful_timeout_ms: 15000,
+    cleanup_fn: async () => {
+      console.error("[CONTRACT] browser_automator cleanup: close any remaining browser contexts");
+    }
+  });
+
+  interruptionHandler.registerToolContract("asset_optimizer", {
+    graceful_timeout_ms: 30000,
+    cleanup_fn: async (pids, tempPaths) => {
+      for (const p of tempPaths) {
+        try {
+          const { existsSync } = require("node:fs");
+          if (existsSync(p)) require("node:fs").unlinkSync(p);
+        } catch {
+          // ignore
+        }
+      }
+    }
+  });
+
+  interruptionHandler.registerToolContract("sandbox", {
+    graceful_timeout_ms: 10000,
+    cleanup_fn: async (pids) => {
+      for (const pid of pids) {
+        try {
+          process.kill(-pid, "SIGKILL");
+        } catch {
+          // ignore
+        }
+      }
+    }
+  });
+
+  interruptionHandler.registerToolContract("backup", {
+    graceful_timeout_ms: 60000,
+    cleanup_fn: async (pids, tempPaths) => {
+      for (const p of tempPaths) {
+        try {
+          const { existsSync } = require("node:fs");
+          if (existsSync(p)) require("node:fs").unlinkSync(p);
+        } catch {
+          // ignore
+        }
+      }
+    }
+  });
+
+  interruptionHandler.registerToolContract("service_manager", {
+    graceful_timeout_ms: 5000
+  });
+
+  interruptionHandler.registerToolContract("patch", {
+    graceful_timeout_ms: 10000
+  });
+
+  interruptionHandler.registerToolContract("binary_inspector", {
+    graceful_timeout_ms: 10000
+  });
+
+  interruptionHandler.registerToolContract("network_audit", {
+    graceful_timeout_ms: 10000
+  });
+
+  interruptionHandler.registerToolContract("search", {
+    graceful_timeout_ms: 10000
+  });
+
+  interruptionHandler.registerToolContract("telemetry", {
+    graceful_timeout_ms: 10000
+  });
+
+  interruptionHandler.registerToolContract("marketing_policy", {
+    graceful_timeout_ms: 5000
+  });
+
+  interruptionHandler.registerToolContract("metrics_ledger", {
+    graceful_timeout_ms: 10000
+  });
+
+  interruptionHandler.registerToolContract("playbook_compiler", {
+    graceful_timeout_ms: 10000
+  });
+
+  interruptionHandler.registerToolContract("agent_loop", {
+    graceful_timeout_ms: 5000
+  });
+}
+
 async function main() {
+  dbHelper.ensureSchema();
+  const runner = new MigrationRunner(dbHelper.getDb());
+  await runner.run();
+
+  registerInterruptionContracts();
+
+  const heartbeat = new Heartbeat(ipcPipe, stateMachine);
+  heartbeat.start();
+
+  const implicationStore = new ImplicationStore();
+
   ipcPipe.start();
   ipcPipe.onIncoming((frame: IpcFrame) => {
     console.error("[ENGINE] IPC RECV:", frame.type, frame.payload);
+    const sessionId = (frame as any).session_id;
     if (frame.type === "human_directive") {
       const payload = frame.payload as { taskId: number; approved: boolean };
-      receiveHumanReconciliationDirective(payload.taskId, payload.approved);
+      interruptionHandler.handleHumanDirective(payload.taskId, payload.approved, sessionId);
     } else if (frame.type === "prompt_submit") {
-      const payload = frame.payload as { mission_id?: string; prompt: string };
-      handlePromptSubmit(payload.mission_id, payload.prompt);
+      const payload = frame.payload as { mission_id?: string; prompt: string; priority?: number; budget_tokens?: number };
+      handlePromptSubmit(payload.mission_id, payload.prompt, payload.priority ?? 0, payload.budget_tokens ?? 50000);
+    } else if (frame.type === "mission_pause") {
+      const payload = frame.payload as { mission_id: string };
+      priorityQueue.pauseMission(payload.mission_id, sessionId);
+      interruptionHandler.interruptMission(payload.mission_id, "operator_pause").catch(() => {});
+    } else if (frame.type === "mission_resume") {
+      const payload = frame.payload as { mission_id: string };
+      priorityQueue.resumeMission(payload.mission_id, sessionId);
+    } else if (frame.type === "budget_refill") {
+      const payload = frame.payload as { tokens: number };
+      budgetPool.refill(payload.tokens || 50000);
+    } else if (frame.type === "mission_cancel") {
+      const payload = frame.payload as { mission_id: string };
+      requestMissionAbort(payload.mission_id);
+      dbHelper.updateMissionQueueStatus(payload.mission_id, "CANCELLED", { completedAt: new Date().toISOString() });
+      dbHelper.updateMissionStatus(payload.mission_id, "CANCELLED", new Date().toISOString());
+      budgetPool.release(payload.mission_id);
+      ipcPipe.sendTo({ type: "state_change", payload: { state: "CANCELLED", mission_id: payload.mission_id } }, sessionId);
+    } else if (frame.type === "mission_interrupt") {
+      const payload = frame.payload as { mission_id: string; force?: boolean };
+      dbHelper.updateMissionQueueStatus(payload.mission_id, "INTERRUPTED");
+      ipcPipe.sendTo({ type: "state_change", payload: { state: "INTERRUPTED", mission_id: payload.mission_id } }, sessionId);
+      ipcPipe.sendTo({ type: "interruption", payload: { mission_id: payload.mission_id, reason: payload.force ? "operator_force_interrupt" : "operator_interrupt" } }, sessionId);
+      interruptionHandler.interruptMission(payload.mission_id, "operator_interrupt").catch(() => {});
+    } else if (frame.type === "mission_priority") {
+      const payload = frame.payload as { mission_id: string; priority: number };
+      const entry = dbHelper.getMissionQueueEntry(payload.mission_id);
+      if (entry) dbHelper.getDb().prepare("UPDATE mission_queue SET priority = ? WHERE mission_id = ?").run(payload.priority, payload.mission_id);
+      ipcPipe.sendTo({ type: "state_change", payload: { state: entry?.status || "QUEUED", mission_id: payload.mission_id } }, sessionId);
+    } else if (frame.type === "mission_budget") {
+      const payload = frame.payload as { mission_id: string; tokens: number };
+      const entry = dbHelper.getMissionQueueEntry(payload.mission_id);
+      if (entry) dbHelper.getDb().prepare("UPDATE mission_queue SET budget_allocated_tokens = ? WHERE mission_id = ?").run(payload.tokens, payload.mission_id);
+      ipcPipe.sendTo({ type: "state_change", payload: { state: entry?.status || "QUEUED", mission_id: payload.mission_id } }, sessionId);
     }
   });
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error("kore-os-TEP System core fully loaded and listening on standard IO channels.");
-  bootstrapAvailableTasks();
+
+  scheduler.start();
+  await resumeInterruptedMissions();
+  await bootstrapAvailableTasks();
 }
 
 main().catch((err) => {

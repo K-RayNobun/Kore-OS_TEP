@@ -1,0 +1,22 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: kore-conversational-postgres
+    environment:
+      POSTGRES_DB: kore_conversational
+      POSTGRES_USER: kore
+      POSTGRES_PASSWORD: kore_local_dev
+    ports:
+      - "5433:5432"
+    volumes:
+      - kore-conversational-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kore -d kore_conversational"]
+      interval: 2s
+      timeout: 5s
+      retries: 5
+    profiles:
+      - conversational-ai
+
+volumes:
+  kore-conversational-pgdata:

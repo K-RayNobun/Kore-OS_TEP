@@ -40,7 +40,7 @@ export class RecursiveRealizationEngine {
             console.log(`[SANDBOX_LOOP] Initiating execution cycle [${loopCounter}/${this.maxIterations}]...`);
 
             try {
-                const compileOutput = await this.sandbox.runIsolatedBinary('/usr/bin/npm', ['run', 'build'], 12000);
+                const compileOutput = await this.sandbox.runIsolatedBinary('/usr/bin/npm', ['run', 'build'], { cpuTimeMs: 12000 });
                 console.log(`[SANDBOX_LOOP] Compilation loop successful on iteration ${loopCounter}.`);
                 return { success: true, logs: compileOutput };
             } catch (sandboxError: any) {

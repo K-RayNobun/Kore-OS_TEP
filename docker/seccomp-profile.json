@@ -1,0 +1,26 @@
+{
+  "defaultAction": "SCMP_ACT_ERRNO",
+  "syscalls": [
+    { "name": "mount", "action": "SCMP_ACT_ERRNO" },
+    { "name": "umount2", "action": "SCMP_ACT_ERRNO" },
+    { "name": "pivot_root", "action": "SCMP_ACT_ERRNO" },
+    { "name": "reboot", "action": "SCMP_ACT_ERRNO" },
+    { "name": "kexec_load", "action": "SCMP_ACT_ERRNO" },
+    { "name": "ptrace", "action": "SCMP_ACT_ERRNO" },
+    { "name": "bpf", "action": "SCMP_ACT_ERRNO" },
+    { "name": "init_module", "action": "SCMP_ACT_ERRNO" },
+    { "name": "finit_module", "action": "SCMP_ACT_ERRNO" },
+    { "name": "delete_module", "action": "SCMP_ACT_ERRNO" },
+    { "name": "iopl", "action": "SCMP_ACT_ERRNO" },
+    { "name": "ioperm", "action": "SCMP_ACT_ERRNO" },
+    { "name": "create_module", "action": "SCMP_ACT_ERRNO" },
+    { "name": "personality", "action": "SCMP_ACT_ERRNO" },
+    { "name": "get_kernel_syms", "action": "SCMP_ACT_ERRNO" },
+    { "name": "acct", "action": "SCMP_ACT_ERRNO" },
+    { "name": "setdomainname", "action": "SCMP_ACT_ERRNO" },
+    { "name": "sethostname", "action": "SCMP_ACT_ERRNO" },
+    { "name": "swapoff", "action": "SCMP_ACT_ERRNO" },
+    { "name": "swapon", "action": "SCMP_ACT_ERRNO" },
+    { "name": "chroot", "action": "SCMP_ACT_ERRNO" }
+  ]
+}

@@ -10,6 +10,10 @@ import { IPC_SOCKET_PATH } from "./utils/ipc_pipe.js";
 import * as db from "./utils/database_helper.js";
 import { captchaInterceptor } from "./utils/captcha_interceptor.js";
 import { getSecureSessionContext } from "./utils/session_manager.js";
+import { BudgetPool } from "./utils/budget_pool.js";
+import { getPolicy } from "./utils/policy.js";
+import { computePriority } from "./utils/priority_policy.js";
+import { serializeMission, serializeSchedule, serializeCheckpoint, serializeInterruption } from "./utils/serializers.js";
 
 const fastify = Fastify({ logger: true });
 
@@ -21,8 +25,62 @@ await fastify.register(cors, {
 });
 
 const KORE_TOKEN = process.env.KORE_CORE_TOKEN || "";
-const cognitionClients = new Set<any>();
-const interventionClients = new Set<any>();
+const cognitionClients = new Map<string, Set<any>>(new Map());
+const interventionClients = new Map<string, Set<any>>(new Map());
+const budgetPool = new BudgetPool();
+
+function getSessionClients(map: Map<string, Set<any>>, sessionId: string | undefined): Set<any> | undefined {
+  if (!sessionId) {
+    return undefined;
+  }
+  let set = map.get(sessionId);
+  if (!set) {
+    set = new Set();
+    map.set(sessionId, set);
+  }
+  return set;
+}
+
+function addClient(map: Map<string, Set<any>>, socket: any, sessionId?: string): void {
+  const set = getSessionClients(map, sessionId);
+  if (set) {
+    set.add(socket);
+  }
+  socket.on("close", () => {
+    if (set) set.delete(socket);
+    if (set && set.size === 0) map.delete(sessionId || "");
+  });
+  socket.on("error", () => {
+    if (set) set.delete(socket);
+    if (set && set.size === 0) map.delete(sessionId || "");
+  });
+}
+
+function sendToSession(map: Map<string, Set<any>>, sessionId: string | undefined, frame: Record<string, unknown>): void {
+  const set = getSessionClients(map, sessionId);
+  if (!set || set.size === 0) return;
+  const payload = JSON.stringify(frame);
+  for (const c of Array.from(set)) {
+    try {
+      c.send(payload);
+    } catch {
+      set.delete(c);
+    }
+  }
+}
+
+function sendToAll(map: Map<string, Set<any>>, frame: Record<string, unknown>): void {
+  const payload = JSON.stringify(frame);
+  for (const set of Array.from(map.values())) {
+    for (const c of Array.from(set)) {
+      try {
+        c.send(payload);
+      } catch {
+        set.delete(c);
+      }
+    }
+  }
+}
 
 const PUBLIC_PATHS = new Set(["/interactive"]);
 
@@ -67,19 +125,46 @@ fastify.get("/api/v1/telemetry", async () => {
     inputTokens,
     outputTokens,
     burnRate: Math.round(burnRate * 100) / 100,
-    ceilActive: state.ceilActive
+    ceilActive: state.ceilActive,
+    budgetRemaining: budgetPool.remaining(),
+    budgetTotal: budgetPool.getTotalAllocated()
   };
 });
 
-fastify.post("/api/v1/telemetry/budget", async () => {
+fastify.post("/api/v1/telemetry/budget", async (request, reply) => {
   const state = loadBudgetState();
   state.ceilActive = !state.ceilActive;
   saveBudgetState(state);
   return { status: "ok", ceilActive: state.ceilActive };
 });
 
-fastify.get("/api/v1/decisions", async () => {
-  const decisions = db.getDecisionsByMission("001");
+fastify.post("/api/v1/budget/refill", async (request) => {
+  const body = (request.body as any) || {};
+  const tokens = Number(body.tokens || 50000);
+  budgetPool.refill(tokens);
+  broadcastBudgetUpdate();
+  return { status: "ok", remaining: budgetPool.remaining(), totalAllocated: budgetPool.getTotalAllocated() };
+});
+
+fastify.get("/api/v1/budget/status", async () => {
+  return {
+    remaining: budgetPool.remaining(),
+    totalAllocated: budgetPool.getTotalAllocated()
+  };
+});
+
+fastify.get("/api/v1/budget", async () => {
+  const state = loadBudgetState();
+  const totalTokens = Number(lastTelemetryResponse.input_tokens ?? 0) + Number(lastTelemetryResponse.output_tokens ?? 0);
+  const elapsedMs = Math.max(1, Date.now() - state.startedAt);
+  const burnRatePerMin = elapsedMs > 0 ? (totalTokens / elapsedMs) * 60000 : 0;
+  return budgetPool.toDto(burnRatePerMin, state.ceilActive);
+});
+
+fastify.get("/api/v1/decisions", async (request) => {
+  const query = (request.query as any) || {};
+  const missionId = typeof query.missionId === "string" && query.missionId.trim() ? query.missionId.trim() : "001";
+  const decisions = db.getDecisionsByMission(missionId);
   const records: any[] = [];
   for (const d of decisions) {
     const taskId = d.task_id as number | undefined;
@@ -124,13 +209,22 @@ fastify.post("/api/v1/jobs/resume", async (request, reply) => {
     reply.status(400).send({ status: "error", message: "sessionId must be a valid task identifier" });
     return;
   }
+  const approved = typeof body.approved === "boolean" ? body.approved : true;
+  const choice = typeof body.choice === "string" ? body.choice : undefined;
+  const answer = typeof body.answer === "string" ? body.answer : undefined;
+
+  if (!approved) {
+    db.createHumanIntervention(`intervention-${taskId}`, taskId, "rejection", JSON.stringify({ choice, answer }));
+    db.resolveHumanIntervention(`intervention-${taskId}`, "REJECTED");
+  }
+
   const frame = JSON.stringify({
     type: "human_directive",
-    payload: { taskId, approved: typeof body.approved === "boolean" ? body.approved : true },
+    payload: { taskId, approved, choice, answer },
   });
   try {
     await sendIpcFrame(frame);
-    return reply.status(200).send({ status: "ok", taskId });
+    return reply.status(200).send({ status: "ok", taskId, approved });
   } catch {
     return reply.status(502).send({ status: "error", message: "IPC pipe unavailable" });
   }
@@ -165,11 +259,140 @@ fastify.post("/api/v1/missions/start", async (request, reply) => {
     return reply.status(400).send({ status: "error", message: "prompt is required" });
   }
   const missionId = typeof body.missionId === "string" && body.missionId.trim() ? body.missionId.trim() : `mission-${Date.now()}`;
-  db.createMission(missionId, prompt);
-  const frame = JSON.stringify({ type: "prompt_submit", payload: { mission_id: missionId, prompt } });
+  const resumeFrom = typeof body.resumeFrom === "string" && body.resumeFrom.trim() ? body.resumeFrom.trim() : undefined;
+  const attributes = (body.attributes && typeof body.attributes === "object") ? body.attributes : undefined;
+  const attributesJson = attributes ? JSON.stringify(attributes) : undefined;
+  const policy = getPolicy();
+  const priority = attributes ? computePriority(attributes, policy) : Number(body.priority || 0);
+  const budgetTokens = attributes && typeof attributes.budgetCap === "number"
+    ? attributes.budgetCap
+    : Number(body.budgetTokens || 50000);
+
+  db.createMission(missionId, prompt, attributesJson);
+  db.createMissionQueueEntry({ missionId, priority, budgetAllocatedTokens: budgetTokens, attributes: attributesJson });
+
+  if (attributes?.recurrence && attributes.recurrence.kind && attributes.recurrence.kind !== "none") {
+    const rec = attributes.recurrence;
+    db.createTaskSchedule({
+      name: `Recurring: ${prompt.slice(0, 60)}`,
+      missionId,
+      cronExpr: rec.cron,
+      intervalMinutes: rec.intervalMinutes,
+      nextTriggerAt: rec.nextAt || new Date(Date.now() + 60000).toISOString(),
+      priorityOverride: priority,
+      budgetAllocatedTokens: budgetTokens,
+      attributes: attributesJson
+    });
+  }
+
+  const framePayload: any = { mission_id: missionId, prompt, priority, budget_tokens: budgetTokens };
+  if (resumeFrom) framePayload.resume_from = resumeFrom;
+  if (attributes) framePayload.attributes = attributes;
+
+  const frame = JSON.stringify({ type: "prompt_submit", session_id: missionId, payload: framePayload });
   try {
     await sendIpcFrame(frame);
-    return reply.status(200).send({ status: "queued", mission_id: missionId });
+    return reply.status(200).send({ status: resumeFrom ? "resuming" : "queued", mission_id: missionId });
+  } catch {
+    return reply.status(502).send({ status: "error", message: "IPC pipe unavailable" });
+  }
+});
+
+fastify.get("/api/v1/policy", async () => {
+  return getPolicy();
+});
+
+fastify.post("/api/v1/missions/:id/pause", async (request, reply) => {
+  const missionId = (request.params as any).id;
+  const frame = JSON.stringify({ type: "mission_pause", session_id: missionId, payload: { mission_id: missionId } });
+  try {
+    await sendIpcFrame(frame);
+    broadcastMissionUpdate();
+    return reply.status(200).send({ status: "paused", mission_id: missionId });
+  } catch {
+    return reply.status(502).send({ status: "error", message: "IPC pipe unavailable" });
+  }
+});
+
+fastify.post("/api/v1/missions/:id/resume", async (request, reply) => {
+  const missionId = (request.params as any).id;
+  const frame = JSON.stringify({ type: "mission_resume", session_id: missionId, payload: { mission_id: missionId } });
+  try {
+    await sendIpcFrame(frame);
+    broadcastMissionUpdate();
+    return reply.status(200).send({ status: "resumed", mission_id: missionId });
+  } catch {
+    return reply.status(502).send({ status: "error", message: "IPC pipe unavailable" });
+  }
+});
+
+fastify.post("/api/v1/missions/:id/cancel", async (request, reply) => {
+  const missionId = (request.params as any).id;
+  const frame = JSON.stringify({ type: "mission_cancel", session_id: missionId, payload: { mission_id: missionId } });
+  try {
+    await sendIpcFrame(frame);
+    db.updateMissionQueueStatus(missionId, "CANCELLED", { completedAt: new Date().toISOString() });
+    broadcastMissionUpdate();
+    return reply.status(200).send({ status: "cancelled", mission_id: missionId });
+  } catch {
+    return reply.status(502).send({ status: "error", message: "IPC pipe unavailable" });
+  }
+});
+
+fastify.post("/api/v1/missions/:id/interrupt", async (request, reply) => {
+  const missionId = (request.params as any).id;
+  const body = (request.body as any) || {};
+  const force = body.force === true;
+  const frame = JSON.stringify({ type: "mission_interrupt", session_id: missionId, payload: { mission_id: missionId, force } });
+  try {
+    await sendIpcFrame(frame);
+    db.updateMissionQueueStatus(missionId, "INTERRUPTED");
+    broadcastMissionUpdate();
+    return reply.status(200).send({ status: "interrupted", mission_id: missionId });
+  } catch {
+    return reply.status(502).send({ status: "error", message: "IPC pipe unavailable" });
+  }
+});
+
+fastify.post("/api/v1/missions/:id/priority", async (request, reply) => {
+  const missionId = (request.params as any).id;
+  const body = (request.body as any) || {};
+  const priority = Number(body.priority);
+  if (!Number.isFinite(priority)) {
+    return reply.status(400).send({ status: "error", message: "priority is required" });
+  }
+  const frame = JSON.stringify({ type: "mission_priority", session_id: missionId, payload: { mission_id: missionId, priority } });
+  try {
+    await sendIpcFrame(frame);
+    db.updateMissionQueueStatus(missionId, db.getMissionQueueEntry(missionId)?.status || "QUEUED");
+    const entry = db.getMissionQueueEntry(missionId);
+    if (entry) {
+      db.getDb().prepare("UPDATE mission_queue SET priority = ? WHERE mission_id = ?").run(priority, missionId);
+    }
+    broadcastMissionUpdate();
+    return reply.status(200).send({ status: "prioritized", mission_id: missionId, priority });
+  } catch {
+    return reply.status(502).send({ status: "error", message: "IPC pipe unavailable" });
+  }
+});
+
+fastify.post("/api/v1/missions/:id/budget", async (request, reply) => {
+  const missionId = (request.params as any).id;
+  const body = (request.body as any) || {};
+  const tokens = Number(body.tokens);
+  if (!Number.isFinite(tokens)) {
+    return reply.status(400).send({ status: "error", message: "tokens is required" });
+  }
+  const frame = JSON.stringify({ type: "mission_budget", session_id: missionId, payload: { mission_id: missionId, tokens } });
+  try {
+    await sendIpcFrame(frame);
+    const entry = db.getMissionQueueEntry(missionId);
+    if (entry) {
+      db.getDb().prepare("UPDATE mission_queue SET budget_allocated_tokens = ? WHERE mission_id = ?").run(tokens, missionId);
+    }
+    broadcastMissionUpdate();
+    broadcastBudgetUpdate();
+    return reply.status(200).send({ status: "budgeted", mission_id: missionId, tokens });
   } catch {
     return reply.status(502).send({ status: "error", message: "IPC pipe unavailable" });
   }
@@ -201,8 +424,111 @@ fastify.get("/api/v1/missions/:id/artifacts", async (request) => {
 
 fastify.get("/api/v1/missions/:id/state", async (request) => {
   const missionId = (request.params as any).id;
-  // State is tracked in engine; gateway returns current known state from IPC cache if available
-  return { mission_id: missionId, state: "UNKNOWN" };
+  const queueEntry = db.getMissionQueueEntry(missionId);
+  const mission = db.getMission(missionId);
+  return {
+    mission_id: missionId,
+    state: queueEntry?.status || "UNKNOWN",
+    priority: queueEntry?.priority || 0,
+    budget_allocated: queueEntry?.budget_allocated_tokens || 0,
+    budget_consumed: queueEntry?.budget_consumed_tokens || 0,
+    started_at: queueEntry?.started_at || null,
+    completed_at: queueEntry?.completed_at || null,
+    prompt: mission?.prompt || null
+  };
+});
+
+fastify.get("/api/v1/missions", async () => {
+  const queue = db.getAllQueueEntries();
+  return queue.map((q: any) => serializeMission(q, db.getMission(q.mission_id)));
+});
+
+fastify.get("/api/v1/missions/:id/checkpoints", async (request) => {
+  const missionId = (request.params as any).id;
+  const rows = db.getCheckpointsByMission(missionId);
+  return rows.map((r: any) => serializeCheckpoint(r));
+});
+
+fastify.get("/api/v1/missions/:id/interruptions", async (request) => {
+  const missionId = (request.params as any).id;
+  const rows = db.getInterruptionsByMission(missionId);
+  return rows.map((r: any) => serializeInterruption(r));
+});
+
+fastify.get("/api/v1/tags", async () => {
+  return db.getDistinctTags();
+});
+
+fastify.post("/api/v1/schedules", async (request, reply) => {
+  const body = (request.body as any) || {};
+  const name = typeof body.name === "string" && body.name.trim() ? body.name.trim() : "";
+  if (!name) {
+    return reply.status(400).send({ status: "error", message: "name is required" });
+  }
+  const cronExpr = typeof body.cronExpr === "string" ? body.cronExpr : undefined;
+  const intervalMinutes = Number(body.intervalMinutes);
+  const now = new Date(Date.now() + 60000).toISOString();
+  const attributes = (body.attributes && typeof body.attributes === "object") ? JSON.stringify(body.attributes) : undefined;
+  const scheduleParams: {
+    name: string;
+    cronExpr?: string;
+    intervalMinutes?: number;
+    nextTriggerAt: string;
+    priorityOverride?: number;
+    budgetAllocatedTokens?: number;
+    missionId?: string;
+    attributes?: string;
+  } = {
+    name,
+    nextTriggerAt: now
+  };
+  if (cronExpr !== undefined) scheduleParams.cronExpr = cronExpr;
+  if (Number.isFinite(intervalMinutes) && intervalMinutes > 0) scheduleParams.intervalMinutes = intervalMinutes;
+  if (body.priorityOverride !== undefined) scheduleParams.priorityOverride = Number(body.priorityOverride);
+  scheduleParams.budgetAllocatedTokens = Number(body.budgetAllocatedTokens || body.budgetTokens || 10000);
+  if (typeof body.missionId === "string") scheduleParams.missionId = body.missionId;
+  if (attributes) scheduleParams.attributes = attributes;
+  const id = db.createTaskSchedule(scheduleParams);
+  return { status: "ok", id };
+});
+
+fastify.get("/api/v1/schedules", async () => {
+  const rows = db.getAllTaskSchedules();
+  return rows.map((r: any) => serializeSchedule(r));
+});
+
+fastify.patch("/api/v1/schedules/:id", async (request, reply) => {
+  const id = Number((request.params as any).id);
+  if (!Number.isFinite(id) || id <= 0) {
+    return reply.status(400).send({ status: "error", message: "invalid schedule id" });
+  }
+  const body = (request.body as any) || {};
+  const updates: { nextTriggerAt?: string; lastStatus?: string; lastRunAt?: string; enabled?: number; priorityOverride?: number; budgetAllocatedTokens?: number; cronExpr?: string; intervalMinutes?: number } = {};
+  if (body.cronExpr !== undefined) updates.cronExpr = String(body.cronExpr);
+  if (body.intervalMinutes !== undefined) updates.intervalMinutes = Number(body.intervalMinutes);
+  if (body.priorityOverride !== undefined) updates.priorityOverride = Number(body.priorityOverride);
+  if (body.budgetAllocatedTokens !== undefined) updates.budgetAllocatedTokens = Number(body.budgetAllocatedTokens);
+  if (body.enabled !== undefined) updates.enabled = body.enabled ? 1 : 0;
+  if (body.nextTriggerAt !== undefined) updates.nextTriggerAt = String(body.nextTriggerAt);
+  db.updateTaskSchedule(id, updates);
+  return { status: "ok", id };
+});
+
+fastify.delete("/api/v1/schedules/:id", async (request, reply) => {
+  const id = Number((request.params as any).id);
+  if (!Number.isFinite(id) || id <= 0) {
+    return reply.status(400).send({ status: "error", message: "invalid schedule id" });
+  }
+  db.deleteTaskSchedule(id);
+  return { status: "ok", id };
+});
+
+fastify.post("/api/v1/schedules/:id/toggle", async (request, reply) => {
+  const id = Number((request.params as any).id);
+  const body = (request.body as any) || {};
+  const enabled = body.enabled ? 1 : 0;
+  db.updateTaskSchedule(id, { enabled: enabled as any });
+  return { status: "ok", id, enabled: enabled === 1 };
 });
 
 fastify.post("/api/v1/push/subscribe", async (request) => {
@@ -237,6 +563,61 @@ fastify.post("/api/v1/push/subscribe", async (request) => {
     // ignore persistence errors in non-Docker environments
   }
   return { status: "ok", count: subscriptions.length };
+});
+
+fastify.get("/pwa", async (request, reply) => {
+  const pwaDir = path.join(process.cwd(), "src", "pwa");
+  const indexPath = path.join(pwaDir, "index.html");
+  try {
+    const html = fs.readFileSync(indexPath, "utf8");
+    reply.type("text/html").send(html);
+  } catch {
+    reply.status(404).send({ error: "PWA not found" });
+  }
+});
+
+fastify.get("/pwa/manifest.json", async (request, reply) => {
+  const manifestPath = path.join(process.cwd(), "src", "pwa", "manifest.json");
+  try {
+    const manifest = fs.readFileSync(manifestPath, "utf8");
+    reply.type("application/json").send(manifest);
+  } catch {
+    reply.status(404).send({ error: "manifest not found" });
+  }
+});
+
+fastify.get("/pwa/sw.js", async (request, reply) => {
+  const swPath = path.join(process.cwd(), "src", "pwa", "sw.js");
+  try {
+    const sw = fs.readFileSync(swPath, "utf8");
+    reply.type("application/javascript").send(sw);
+  } catch {
+    reply.status(404).send({ error: "service worker not found" });
+  }
+});
+
+fastify.get("/pwa/app.js", async (request, reply) => {
+  const appPath = path.join(process.cwd(), "src", "pwa", "app.js");
+  try {
+    const app = fs.readFileSync(appPath, "utf8");
+    reply.type("application/javascript").send(app);
+  } catch {
+    reply.status(404).send({ error: "app not found" });
+  }
+});
+
+fastify.get("/pwa/styles.css", async (request, reply) => {
+  const cssPath = path.join(process.cwd(), "src", "pwa", "styles.css");
+  try {
+    const css = fs.readFileSync(cssPath, "utf8");
+    reply.type("text/css").send(css);
+  } catch {
+    reply.status(404).send({ error: "styles not found" });
+  }
+});
+
+fastify.get("/pwa/*", async (request, reply) => {
+  reply.status(404).send({ error: "not found" });
 });
 
 fastify.get("/api/v1/captcha/active", async (request) => {
@@ -290,33 +671,52 @@ fastify.get("/interactive", async (request, reply) => {
 });
 
 fastify.register(async function (fastify) {
-  fastify.get("/api/v1/stream/cognition", { websocket: true }, (socket) => {
-    cognitionClients.add(socket);
-    socket.send(JSON.stringify({ intent: "Idle", rationale: "" }));
-    socket.on("close", () => cognitionClients.delete(socket));
+  fastify.get("/api/v1/stream/cognition", { websocket: true }, (socket, req) => {
+    const query = (req as any).query || {};
+    const sessionId = typeof query.session_id === "string" ? query.session_id : undefined;
+    addClient(cognitionClients, socket, sessionId);
+    socket.send(JSON.stringify({ intent: "Idle", rationale: "", session_id: sessionId }));
+    socket.on("close", () => {
+      if (sessionId) {
+        const set = cognitionClients.get(sessionId);
+        if (set) { set.delete(socket); if (set.size === 0) cognitionClients.delete(sessionId); }
+      }
+    });
   });
 });
 
 fastify.register(async function (fastify) {
-  fastify.get("/api/v1/stream/intervention", { websocket: true }, (socket) => {
-    interventionClients.add(socket);
+  fastify.get("/api/v1/stream/intervention", { websocket: true }, (socket, req) => {
+    const query = (req as any).query || {};
+    const sessionId = typeof query.session_id === "string" ? query.session_id : undefined;
+    addClient(interventionClients, socket, sessionId);
     const active = captchaInterceptor.getActive();
     if (active) {
       const base = process.env.KORE_PUBLIC_URL || `http://${socket.remoteAddress || "localhost"}:${process.env.KORE_GATEWAY_PORT || 3000}`;
       try {
-        socket.send(JSON.stringify({
+        const wsFrame = {
           type: "intervention_request",
+          session_id: sessionId,
           payload: {
             intervention_type: "captcha",
             task_id: active.taskId,
             url: `${base}${active.url}&interactive=true&showControls=true`
           }
-        }));
+        };
+        socket.send(JSON.stringify(wsFrame));
       } catch {
-        interventionClients.delete(socket);
+        if (sessionId) {
+          const set = interventionClients.get(sessionId);
+          if (set) { set.delete(socket); if (set.size === 0) interventionClients.delete(sessionId); }
+        }
       }
     }
-    socket.on("close", () => interventionClients.delete(socket));
+    socket.on("close", () => {
+      if (sessionId) {
+        const set = interventionClients.get(sessionId);
+        if (set) { set.delete(socket); if (set.size === 0) interventionClients.delete(sessionId); }
+      }
+    });
   });
 });
 
@@ -350,6 +750,9 @@ function connectIpcPipe(): void {
         const payload = frame.payload || {};
         if (payload.input_tokens !== undefined) lastTelemetryResponse.input_tokens = payload.input_tokens;
         if (payload.output_tokens !== undefined) lastTelemetryResponse.output_tokens = payload.output_tokens;
+        if (payload.input_tokens !== undefined || payload.output_tokens !== undefined) {
+          broadcastBudgetUpdate();
+        }
       }
       captchaInterceptor.ingest(frame);
       if (frame.type === "telemetry_response") {
@@ -358,57 +761,80 @@ function connectIpcPipe(): void {
       }
       if (frame.type === "thinking") {
         const payload = frame.payload || {};
+        const sessionId = (frame as any).session_id;
         const cognitionFrame = {
+          session_id: sessionId,
           intent: (payload as any).action || "thinking",
           rationale: (payload as any).thought || ""
         };
-        for (const c of Array.from(cognitionClients)) {
-          try {
-            c.send(JSON.stringify(cognitionFrame));
-          } catch {
-            cognitionClients.delete(c);
-          }
-        }
+        sendToSession(cognitionClients, sessionId, cognitionFrame);
+        sendToAll(cognitionClients, cognitionFrame);
       }
       if (frame.type === "intercept_start") {
         const payload = frame.payload || {};
         const taskId = Number(payload.task_id ?? 0);
+        const sessionId = (frame as any).session_id;
         if (Number.isFinite(taskId) && taskId > 0) {
           const base = process.env.KORE_PUBLIC_URL || `http://localhost:${process.env.KORE_GATEWAY_PORT || 3000}`;
           const wsFrame = {
             type: "intervention_request",
+            session_id: sessionId,
             payload: {
               intervention_type: "captcha",
               task_id: taskId,
               url: `${base}/interactive?taskId=${taskId}&interactive=true&showControls=true`
             }
           };
-          for (const c of Array.from(interventionClients)) {
-            try {
-              c.send(JSON.stringify(wsFrame));
-            } catch {
-              interventionClients.delete(c);
-            }
-          }
+          sendToSession(interventionClients, sessionId, wsFrame);
+          sendToAll(interventionClients, wsFrame);
         }
       }
       if (frame.type === "intervention_request") {
-        for (const c of Array.from(interventionClients)) {
-          try {
-            c.send(JSON.stringify(frame));
-          } catch {
-            interventionClients.delete(c);
-          }
-        }
+        const sessionId = (frame as any).session_id;
+        const out = { ...frame, session_id: sessionId };
+        sendToSession(interventionClients, sessionId, out);
+        sendToAll(interventionClients, out);
       }
       if (frame.type === "state_change") {
-        for (const c of Array.from(interventionClients)) {
-          try {
-            c.send(JSON.stringify(frame));
-          } catch {
-            interventionClients.delete(c);
-          }
-        }
+        const sessionId = (frame as any).session_id;
+        const out = { ...frame, session_id: sessionId };
+        sendToSession(interventionClients, sessionId, out);
+        sendToAll(interventionClients, out);
+        broadcastMissionUpdate();
+      }
+      if (frame.type === "tool_execution") {
+        const sessionId = (frame as any).session_id;
+        const out = { ...frame, session_id: sessionId };
+        sendToSession(interventionClients, sessionId, out);
+        sendToAll(interventionClients, out);
+      }
+      if (frame.type === "mission_update") {
+        const sessionId = (frame as any).session_id;
+        const out = { ...frame, session_id: sessionId };
+        sendToSession(interventionClients, sessionId, out);
+        sendToAll(interventionClients, out);
+      }
+      if (frame.type === "budget_update") {
+        const out = { ...frame };
+        sendToAll(interventionClients, out);
+      }
+      if (frame.type === "checkpoint") {
+        const sessionId = (frame as any).session_id;
+        const out = { ...frame, session_id: sessionId };
+        sendToSession(interventionClients, sessionId, out);
+        sendToAll(interventionClients, out);
+      }
+      if (frame.type === "interruption") {
+        const sessionId = (frame as any).session_id;
+        const out = { ...frame, session_id: sessionId };
+        sendToSession(interventionClients, sessionId, out);
+        sendToAll(interventionClients, out);
+      }
+      if (frame.type === "alert") {
+        const sessionId = (frame as any).session_id;
+        const out = { ...frame, session_id: sessionId };
+        sendToSession(interventionClients, sessionId, out);
+        sendToAll(interventionClients, out);
       }
       if (frame.type === "artifact_manifest") {
         const payload = frame.payload as any;
@@ -424,6 +850,19 @@ function connectIpcPipe(): void {
               payload.mime_type || "application/octet-stream"
             );
           } catch {}
+        }
+      }
+      if (frame.type === "telemetry_heartbeat") {
+        const payload = frame.payload || {};
+        lastTelemetryResponse.input_tokens = payload.tokens ?? lastTelemetryResponse.input_tokens;
+        lastTelemetryResponse.burn_rate = payload.burn_rate ?? lastTelemetryResponse.burn_rate;
+        if (payload.cpu !== undefined || payload.ram !== undefined) {
+          const heartbeatFrame = {
+            type: "telemetry_heartbeat",
+            session_id: (frame as any).session_id,
+            payload
+          };
+          sendToSession(cognitionClients, (frame as any).session_id, heartbeatFrame);
         }
       }
     }
@@ -464,6 +903,21 @@ async function sendIpcFrame(frame: string): Promise<void> {
   ipcClient.write(frame + "\n");
 }
 
+function broadcastBudgetUpdate(): void {
+  const state = loadBudgetState();
+  const totalTokens = Number(lastTelemetryResponse.input_tokens ?? 0) + Number(lastTelemetryResponse.output_tokens ?? 0);
+  const elapsedMs = Math.max(1, Date.now() - state.startedAt);
+  const burnRatePerMin = elapsedMs > 0 ? (totalTokens / elapsedMs) * 60000 : 0;
+  const payload = budgetPool.toDto(burnRatePerMin, state.ceilActive);
+  sendToAll(interventionClients, { type: "budget_update", payload: { pool: payload } });
+}
+
+function broadcastMissionUpdate(): void {
+  const queue = db.getAllQueueEntries();
+  const missions = queue.map((q: any) => serializeMission(q, db.getMission(q.mission_id)));
+  sendToAll(interventionClients, { type: "mission_update", payload: { missions } });
+}
+
 connectIpcPipe();
 
 let lastTelemetryResponse: Record<string, unknown> = {};
@@ -495,6 +949,7 @@ function saveBudgetState(state: BudgetState): void {
 
 const start = async () => {
   try {
+    budgetPool.initialize(Number(process.env.KORE_BUDGET_POOL_TOKENS || 100000));
     const port = Number(process.env.KORE_GATEWAY_PORT || 3000);
     await fastify.listen({ port, host: "0.0.0.0" });
     console.error(`[GATEWAY] Fastify listening on :${port}`);

@@ -31,7 +31,8 @@ export class SecurityGuard {
     private readonly ALLOWED_ROOTS = [
         path.resolve('/home/elo/workspace'),
         path.resolve('/home/elo/data'),
-        path.resolve('/tmp')
+        path.resolve('/tmp'),
+        path.resolve('/home/elo/.local/share/browser-context')
     ];
 
     private readonly BANNED_PATTERNS = [

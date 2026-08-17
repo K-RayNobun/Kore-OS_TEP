@@ -272,7 +272,7 @@ export async function dispatchTool(action: ToolAction, rawParams: unknown): Prom
       }
 
       case "STAGE_SECURE_BACKUP": {
-        const target = toolInstances.backup.createSnapshot(v.backupName);
+        const target = await toolInstances.backup.createSnapshot(v.backupName, v.sourcePath);
         return {
           status: "SUCCESS",
           output: { backupPath: target, sourcePath: v.sourcePath },
@@ -435,4 +435,18 @@ export function getAvailableActions(): { action: ToolAction; description: string
     { action: "REFORMULATE_PROMPT", description: "Transform raw prompts into structured tool chains" },
     { action: "SYS_INSPECT", description: "Unified system instrumentation utility to query environment state, read AST skeletons, or retrieve forensic runtime logs" }
   ];
+}
+
+export class ToolRunner {
+  static async run(action: ToolAction, rawParams: unknown, options: { signal?: AbortSignal; missionId?: string } = {}): Promise<ToolResult> {
+    if (options.signal?.aborted) {
+      return {
+        status: "ERROR",
+        error: "Tool execution aborted before start",
+        executionTimeMs: 0,
+        validation_error: "AbortSignal triggered before execution"
+      };
+    }
+    return dispatchTool(action, rawParams);
+  }
 }
